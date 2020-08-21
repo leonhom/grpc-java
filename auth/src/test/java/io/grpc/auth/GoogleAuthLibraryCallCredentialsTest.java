@@ -38,6 +38,7 @@ import com.google.common.collect.Iterables;
 import com.google.common.collect.LinkedListMultimap;
 import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Multimaps;
+import com.google.common.io.BaseEncoding;
 import io.grpc.Attributes;
 import io.grpc.CallCredentials;
 import io.grpc.CallCredentials.MetadataApplier;
@@ -45,6 +46,7 @@ import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.SecurityLevel;
 import io.grpc.Status;
+import io.grpc.internal.JsonParser;
 import io.grpc.testing.TestMethodDescriptors;
 import java.io.IOException;
 import java.net.URI;
@@ -386,6 +388,36 @@ public class GoogleAuthLibraryCallCredentialsTest {
     Iterable<String> authorization = headers.getAll(AUTHORIZATION);
     assertArrayEquals(new String[]{"token1"},
         Iterables.toArray(authorization, String.class));
+  }
+
+  @Test
+  public void jwtAccessCredentialsInRequestMetadata() throws Exception {
+    KeyPair pair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+
+    ServiceAccountCredentials credentials =
+        ServiceAccountCredentials.newBuilder()
+            .setClientId("test-client")
+            .setClientEmail("test-email@example.com")
+            .setPrivateKey(pair.getPrivate())
+            .setPrivateKeyId("test-private-key-id")
+            .build();
+    GoogleAuthLibraryCallCredentials callCredentials =
+        new GoogleAuthLibraryCallCredentials(credentials);
+    callCredentials.applyRequestMetadata(new RequestInfoImpl("example.com:123"), executor, applier);
+
+    verify(applier).apply(headersCaptor.capture());
+    Metadata headers = headersCaptor.getValue();
+    String token =
+        Iterables.getOnlyElement(headers.getAll(AUTHORIZATION)).substring("Bearer ".length());
+    String[] parts = token.split("\\.", 3);
+    String jsonHeader = new String(BaseEncoding.base64Url().decode(parts[0]), US_ASCII);
+    String jsonPayload = new String(BaseEncoding.base64Url().decode(parts[1]), US_ASCII);
+    Map<?, ?> header = (Map<?, ?>) JsonParser.parse(jsonHeader);
+    assertEquals("test-private-key-id", header.get("kid"));
+    Map<?, ?> payload = (Map<?, ?>) JsonParser.parse(jsonPayload);
+    assertEquals("https://example.com:123/a.service", payload.get("aud"));
+    assertEquals("test-email@example.com", payload.get("iss"));
+    assertEquals("test-email@example.com", payload.get("sub"));
   }
 
   private int runPendingRunnables() {
