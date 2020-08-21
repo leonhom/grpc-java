@@ -17,6 +17,7 @@
 package io.grpc.internal;
 
 import static com.google.common.truth.Truth.assertThat;
+import static io.grpc.internal.ClientCallImpl.DEADLINE_EXPIRATION_CANCEL_DELAY_NANOS;
 import static io.grpc.internal.GrpcUtil.ACCEPT_ENCODING_SPLITTER;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -34,14 +35,13 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyZeroInteractions;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.google.common.collect.ImmutableSet;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.common.util.concurrent.SettableFuture;
 import io.grpc.Attributes;
-import io.grpc.Attributes.Key;
 import io.grpc.CallOptions;
 import io.grpc.ClientCall;
 import io.grpc.ClientStreamTracer;
@@ -54,7 +54,8 @@ import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.MethodDescriptor.MethodType;
 import io.grpc.Status;
-import io.grpc.internal.ClientCallImpl.ClientTransportProvider;
+import io.grpc.Status.Code;
+import io.grpc.internal.ClientCallImpl.ClientStreamProvider;
 import io.grpc.internal.testing.SingleMessageProducer;
 import io.grpc.testing.TestMethodDescriptors;
 import java.io.ByteArrayInputStream;
@@ -106,18 +107,13 @@ public class ClientCallImplTest {
   @Rule
   public final MockitoRule mocks = MockitoJUnit.rule();
 
-  @Mock private ClientStreamListener streamListener;
-  @Mock private ClientTransport clientTransport;
   @Captor private ArgumentCaptor<Status> statusCaptor;
 
   @Mock
   private ClientStreamTracer.Factory streamTracerFactory;
 
   @Mock
-  private ClientTransport transport;
-
-  @Mock
-  private ClientTransportProvider provider;
+  private ClientStreamProvider clientStreamProvider;
 
   @Mock
   private ClientStream stream;
@@ -131,13 +127,18 @@ public class ClientCallImplTest {
   @Captor
   private ArgumentCaptor<Status> statusArgumentCaptor;
 
+  @Captor
+  private ArgumentCaptor<Metadata> metadataArgumentCaptor;
+
   private CallOptions baseCallOptions;
 
   @Before
   public void setUp() {
-    when(provider.get(any(PickSubchannelArgsImpl.class))).thenReturn(transport);
-    when(transport.newStream(
-            any(MethodDescriptor.class), any(Metadata.class), any(CallOptions.class)))
+    when(clientStreamProvider.newStream(
+            (MethodDescriptor<?, ?>) any(MethodDescriptor.class),
+            any(CallOptions.class),
+            any(Metadata.class),
+            any(Context.class)))
         .thenReturn(stream);
     doAnswer(new Answer<Void>() {
         @Override
@@ -152,7 +153,7 @@ public class ClientCallImplTest {
 
   @After
   public void tearDown() {
-    verifyZeroInteractions(streamTracerFactory);
+    verifyNoInteractions(streamTracerFactory);
   }
 
   @Test
@@ -162,10 +163,9 @@ public class ClientCallImplTest {
         method,
         executor,
         baseCallOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */);
+        channelCallTracer);
     call.start(callListener, new Metadata());
     verify(stream).start(listenerArgumentCaptor.capture());
     final ClientStreamListener streamListener = listenerArgumentCaptor.getValue();
@@ -184,10 +184,9 @@ public class ClientCallImplTest {
         method,
         executor,
         baseCallOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */);
+        channelCallTracer);
     call.start(callListener, new Metadata());
     verify(stream).start(listenerArgumentCaptor.capture());
     final ClientStreamListener streamListener = listenerArgumentCaptor.getValue();
@@ -222,10 +221,9 @@ public class ClientCallImplTest {
         method,
         executor,
         baseCallOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */);
+        channelCallTracer);
     call.start(callListener, new Metadata());
     verify(stream).start(listenerArgumentCaptor.capture());
     final ClientStreamListener streamListener = listenerArgumentCaptor.getValue();
@@ -252,16 +250,59 @@ public class ClientCallImplTest {
   }
 
   @Test
+  public void exceptionInOnHeadersHasOnCloseQueuedLast() {
+    class PointOfNoReturnExecutor implements Executor {
+      boolean rejectNewRunnables;
+
+      @Override public void execute(Runnable command) {
+        assertThat(rejectNewRunnables).isFalse();
+        command.run();
+      }
+    }
+
+    final PointOfNoReturnExecutor executor = new PointOfNoReturnExecutor();
+    ClientCallImpl<Void, Void> call = new ClientCallImpl<>(
+        method,
+        executor,
+        baseCallOptions,
+        clientStreamProvider,
+        deadlineCancellationExecutor,
+        channelCallTracer);
+    callListener = new NoopClientCall.NoopClientCallListener<Void>() {
+      private final RuntimeException failure = new RuntimeException("bad");
+
+      @Override public void onHeaders(Metadata metadata) {
+        throw failure;
+      }
+
+      @Override public void onClose(Status status, Metadata metadata) {
+        verify(stream).cancel(same(status));
+        assertThat(status.getCode()).isEqualTo(Status.Code.CANCELLED);
+        assertThat(status.getCause()).isSameInstanceAs(failure);
+        // At the point onClose() is called the user may shut down the executor, so no further
+        // Runnables may be scheduled. The only thread-safe way of guaranteeing that is for
+        // onClose() to be queued last.
+        executor.rejectNewRunnables = true;
+      }
+    };
+    call.start(callListener, new Metadata());
+    verify(stream).start(listenerArgumentCaptor.capture());
+    final ClientStreamListener streamListener = listenerArgumentCaptor.getValue();
+
+    streamListener.headersRead(new Metadata());
+    streamListener.closed(Status.OK, new Metadata());
+  }
+
+  @Test
   public void exceptionInOnReadyTakesPrecedenceOverServer() {
     DelayedExecutor executor = new DelayedExecutor();
     ClientCallImpl<Void, Void> call = new ClientCallImpl<>(
         method.toBuilder().setType(MethodType.UNKNOWN).build(),
         executor,
         baseCallOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */);
+        channelCallTracer);
     call.start(callListener, new Metadata());
     verify(stream).start(listenerArgumentCaptor.capture());
     final ClientStreamListener streamListener = listenerArgumentCaptor.getValue();
@@ -293,16 +334,16 @@ public class ClientCallImplTest {
         method,
         MoreExecutors.directExecutor(),
         baseCallOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */)
+        channelCallTracer)
             .setDecompressorRegistry(decompressorRegistry);
 
     call.start(callListener, new Metadata());
 
     ArgumentCaptor<Metadata> metadataCaptor = ArgumentCaptor.forClass(Metadata.class);
-    verify(transport).newStream(eq(method), metadataCaptor.capture(), same(baseCallOptions));
+    verify(clientStreamProvider)
+        .newStream(eq(method), same(baseCallOptions), metadataCaptor.capture(), any(Context.class));
     Metadata actual = metadataCaptor.getValue();
 
     // there should only be one.
@@ -317,10 +358,9 @@ public class ClientCallImplTest {
         method,
         MoreExecutors.directExecutor(),
         baseCallOptions.withAuthority("overridden-authority"),
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */)
+        channelCallTracer)
             .setDecompressorRegistry(decompressorRegistry);
 
     call.start(callListener, new Metadata());
@@ -334,16 +374,16 @@ public class ClientCallImplTest {
         method,
         MoreExecutors.directExecutor(),
         callOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */)
+        channelCallTracer)
         .setDecompressorRegistry(decompressorRegistry);
     final Metadata metadata = new Metadata();
 
     call.start(callListener, metadata);
 
-    verify(transport).newStream(same(method), same(metadata), same(callOptions));
+    verify(clientStreamProvider)
+        .newStream(same(method), same(callOptions), same(metadata), any(Context.class));
   }
 
   @Test
@@ -353,10 +393,9 @@ public class ClientCallImplTest {
         MoreExecutors.directExecutor(),
         // Don't provide an authority
         baseCallOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */)
+        channelCallTracer)
             .setDecompressorRegistry(decompressorRegistry);
 
     call.start(callListener, new Metadata());
@@ -524,10 +563,9 @@ public class ClientCallImplTest {
         method.toBuilder().setType(MethodType.UNKNOWN).build(),
         new SerializingExecutor(Executors.newSingleThreadExecutor()),
         baseCallOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */)
+        channelCallTracer)
             .setDecompressorRegistry(decompressorRegistry);
 
     context.detach(previous);
@@ -602,10 +640,9 @@ public class ClientCallImplTest {
         method,
         new SerializingExecutor(Executors.newSingleThreadExecutor()),
         baseCallOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */)
+        channelCallTracer)
             .setDecompressorRegistry(decompressorRegistry);
 
     cancellableContext.detach(previous);
@@ -632,10 +669,9 @@ public class ClientCallImplTest {
         method,
         new SerializingExecutor(Executors.newSingleThreadExecutor()),
         baseCallOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */)
+        channelCallTracer)
         .setDecompressorRegistry(decompressorRegistry);
 
     cancellableContext.detach(previous);
@@ -659,7 +695,7 @@ public class ClientCallImplTest {
     call.halfClose();
 
     // Stream should never be created.
-    verifyZeroInteractions(transport);
+    verifyNoInteractions(clientStreamProvider);
 
     try {
       call.sendMessage(null);
@@ -677,19 +713,22 @@ public class ClientCallImplTest {
         method,
         new SerializingExecutor(Executors.newSingleThreadExecutor()),
         callOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */)
+        channelCallTracer)
             .setDecompressorRegistry(decompressorRegistry);
     call.start(callListener, new Metadata());
-    verify(transport, times(0))
-        .newStream(any(MethodDescriptor.class), any(Metadata.class), any(CallOptions.class));
+    verify(clientStreamProvider, never())
+        .newStream(
+            (MethodDescriptor<?, ?>) any(MethodDescriptor.class),
+            any(CallOptions.class),
+            any(Metadata.class),
+            any(Context.class));
     verify(callListener, timeout(1000)).onClose(statusCaptor.capture(), any(Metadata.class));
     assertEquals(Status.Code.DEADLINE_EXCEEDED, statusCaptor.getValue().getCode());
     assertThat(statusCaptor.getValue().getDescription())
         .startsWith("ClientCall started after deadline exceeded");
-    verifyZeroInteractions(provider);
+    verifyNoInteractions(clientStreamProvider);
   }
 
   @Test
@@ -702,10 +741,9 @@ public class ClientCallImplTest {
         method,
         MoreExecutors.directExecutor(),
         baseCallOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */);
+        channelCallTracer);
     call.start(callListener, new Metadata());
 
     context.detach(origContext);
@@ -727,10 +765,9 @@ public class ClientCallImplTest {
         method,
         MoreExecutors.directExecutor(),
         callOpts,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */);
+        channelCallTracer);
     call.start(callListener, new Metadata());
 
     context.detach(origContext);
@@ -752,10 +789,9 @@ public class ClientCallImplTest {
         method,
         MoreExecutors.directExecutor(),
         callOpts,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */);
+        channelCallTracer);
     call.start(callListener, new Metadata());
 
     context.detach(origContext);
@@ -773,10 +809,9 @@ public class ClientCallImplTest {
         method,
         MoreExecutors.directExecutor(),
         callOpts,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */);
+        channelCallTracer);
     call.start(callListener, new Metadata());
 
     ArgumentCaptor<Deadline> deadlineCaptor = ArgumentCaptor.forClass(Deadline.class);
@@ -791,10 +826,9 @@ public class ClientCallImplTest {
         method,
         MoreExecutors.directExecutor(),
         baseCallOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */);
+        channelCallTracer);
     call.start(callListener, new Metadata());
 
     verify(stream, never()).setDeadline(any(Deadline.class));
@@ -808,46 +842,64 @@ public class ClientCallImplTest {
     ClientCallImpl<Void, Void> call = new ClientCallImpl<>(
         method,
         MoreExecutors.directExecutor(),
-        baseCallOptions.withDeadline(Deadline.after(1, TimeUnit.SECONDS)),
-        provider,
+        baseCallOptions.withDeadline(
+            Deadline.after(1, TimeUnit.SECONDS, fakeClock.getDeadlineTicker())),
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */);
+        channelCallTracer);
 
     call.start(callListener, new Metadata());
 
-    fakeClock.forwardNanos(TimeUnit.SECONDS.toNanos(1) + 1);
+    fakeClock.forwardTime(1000, TimeUnit.MILLISECONDS);
 
-    verify(stream, times(1)).cancel(statusCaptor.capture());
+    // Verify cancel sent to application when deadline just past
+    verify(callListener).onClose(statusCaptor.capture(), metadataArgumentCaptor.capture());
+    assertThat(statusCaptor.getValue().getDescription())
+        .matches("deadline exceeded after [0-9]+\\.[0-9]+s. \\[remote_addr=127\\.0\\.0\\.1:443\\]");
+    assertThat(statusCaptor.getValue().getCode()).isEqualTo(Code.DEADLINE_EXCEEDED);
+    verify(stream, never()).cancel(statusCaptor.capture());
+
+    fakeClock.forwardNanos(DEADLINE_EXPIRATION_CANCEL_DELAY_NANOS - 1);
+    verify(stream, never()).cancel(any(Status.class));
+
+    // verify cancel send to server is delayed with DEADLINE_EXPIRATION_CANCEL_DELAY
+    fakeClock.forwardNanos(1);
+    verify(stream).cancel(statusCaptor.capture());
     assertEquals(Status.Code.DEADLINE_EXCEEDED, statusCaptor.getValue().getCode());
     assertThat(statusCaptor.getValue().getDescription())
-        .matches("deadline exceeded after [0-9]+ns. \\[remote_addr=127\\.0\\.0\\.1:443\\]");
+        .matches("deadline exceeded after [0-9]+\\.[0-9]+s. \\[remote_addr=127\\.0\\.0\\.1:443\\]");
   }
 
   @Test
   public void expiredDeadlineCancelsStream_Context() {
     fakeClock.forwardTime(System.nanoTime(), TimeUnit.NANOSECONDS);
 
-    Context context = Context.current()
-        .withDeadlineAfter(1, TimeUnit.SECONDS, deadlineCancellationExecutor);
+    Deadline deadline = Deadline.after(1, TimeUnit.SECONDS, fakeClock.getDeadlineTicker());
+    Context context = Context.current().withDeadline(deadline, deadlineCancellationExecutor);
     Context origContext = context.attach();
 
     ClientCallImpl<Void, Void> call = new ClientCallImpl<>(
         method,
         MoreExecutors.directExecutor(),
         baseCallOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */);
+        channelCallTracer);
 
     context.detach(origContext);
 
     call.start(callListener, new Metadata());
 
-    fakeClock.forwardNanos(TimeUnit.SECONDS.toNanos(1) + 1);
+    fakeClock.forwardTime(1000, TimeUnit.MILLISECONDS);
+    verify(stream, never()).cancel(statusCaptor.capture());
+    // verify app is notified.
+    verify(callListener).onClose(statusCaptor.capture(), metadataArgumentCaptor.capture());
+    assertThat(statusCaptor.getValue().getDescription()).contains("context timed out");
+    assertThat(statusCaptor.getValue().getCode()).isEqualTo(Code.DEADLINE_EXCEEDED);
 
-    verify(stream, times(1)).cancel(statusCaptor.capture());
+    // verify cancel send to server is delayed with DEADLINE_EXPIRATION_CANCEL_DELAY
+    fakeClock.forwardNanos(DEADLINE_EXPIRATION_CANCEL_DELAY_NANOS);
+    verify(stream).cancel(statusCaptor.capture());
     assertEquals(Status.Code.DEADLINE_EXCEEDED, statusCaptor.getValue().getCode());
     assertThat(statusCaptor.getValue().getDescription()).isEqualTo("context timed out");
   }
@@ -860,10 +912,9 @@ public class ClientCallImplTest {
         method,
         MoreExecutors.directExecutor(),
         baseCallOptions.withDeadline(Deadline.after(1, TimeUnit.SECONDS)),
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */);
+        channelCallTracer);
     call.start(callListener, new Metadata());
     call.cancel("canceled", null);
 
@@ -885,10 +936,9 @@ public class ClientCallImplTest {
         method,
         MoreExecutors.directExecutor(),
         baseCallOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */);
+        channelCallTracer);
 
     Metadata headers = new Metadata();
 
@@ -903,10 +953,9 @@ public class ClientCallImplTest {
         method,
         MoreExecutors.directExecutor(),
         baseCallOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */);
+        channelCallTracer);
     final Exception cause = new Exception();
     ClientCall.Listener<Void> callListener =
         new ClientCall.Listener<Void>() {
@@ -941,10 +990,9 @@ public class ClientCallImplTest {
         method,
         new SerializingExecutor(Executors.newSingleThreadExecutor()),
         callOptions,
-        provider,
+        clientStreamProvider,
         deadlineCancellationExecutor,
-        channelCallTracer,
-        false /* retryEnabled */)
+        channelCallTracer)
             .setDecompressorRegistry(decompressorRegistry);
 
     call.start(callListener, new Metadata());
@@ -956,10 +1004,10 @@ public class ClientCallImplTest {
   @Test
   public void getAttributes() {
     ClientCallImpl<Void, Void> call = new ClientCallImpl<>(
-        method, MoreExecutors.directExecutor(), baseCallOptions, provider,
-        deadlineCancellationExecutor, channelCallTracer, false /* retryEnabled */);
-    Attributes attrs =
-        Attributes.newBuilder().set(Key.<String>create("fake key"), "fake value").build();
+        method, MoreExecutors.directExecutor(), baseCallOptions, clientStreamProvider,
+        deadlineCancellationExecutor, channelCallTracer);
+    Attributes attrs = Attributes.newBuilder().set(
+        Attributes.Key.<String>create("fake key"), "fake value").build();
     when(stream.getAttributes()).thenReturn(attrs);
 
     assertNotEquals(attrs, call.getAttributes());

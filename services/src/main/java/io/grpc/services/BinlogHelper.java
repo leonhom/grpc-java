@@ -46,12 +46,10 @@ import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.MethodDescriptor.Marshaller;
 import io.grpc.ServerCall;
-import io.grpc.ServerCall.Listener;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.Status;
 import io.grpc.binarylog.v1.Address;
-import io.grpc.binarylog.v1.Address.Type;
 import io.grpc.binarylog.v1.GrpcLogEntry;
 import io.grpc.binarylog.v1.GrpcLogEntry.EventType;
 import io.grpc.binarylog.v1.Message;
@@ -408,7 +406,7 @@ final class BinlogHelper {
 
         return new SimpleForwardingClientCall<ReqT, RespT>(next.newCall(method, callOptions)) {
           @Override
-          public void start(final Listener<RespT> responseListener, Metadata headers) {
+          public void start(final ClientCall.Listener<RespT> responseListener, Metadata headers) {
             final Duration timeout = deadline == null ? null
                 : Durations.fromNanos(deadline.timeRemaining(TimeUnit.NANOSECONDS));
             writer.logClientHeader(
@@ -500,7 +498,7 @@ final class BinlogHelper {
   public ServerInterceptor getServerInterceptor(final long callId) {
     return new ServerInterceptor() {
       @Override
-      public <ReqT, RespT> Listener<ReqT> interceptCall(
+      public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
           final ServerCall<ReqT, RespT> call,
           Metadata headers,
           ServerCallHandler<ReqT, RespT> next) {
@@ -792,10 +790,10 @@ final class BinlogHelper {
     if (address instanceof InetSocketAddress) {
       InetAddress inetAddress = ((InetSocketAddress) address).getAddress();
       if (inetAddress instanceof Inet4Address) {
-        builder.setType(Type.TYPE_IPV4)
+        builder.setType(Address.Type.TYPE_IPV4)
             .setAddress(InetAddressUtil.toAddrString(inetAddress));
       } else if (inetAddress instanceof Inet6Address) {
-        builder.setType(Type.TYPE_IPV6)
+        builder.setType(Address.Type.TYPE_IPV6)
             .setAddress(InetAddressUtil.toAddrString(inetAddress));
       } else {
         logger.log(Level.SEVERE, "unknown type of InetSocketAddress: {}", address);
@@ -804,10 +802,10 @@ final class BinlogHelper {
       builder.setIpPort(((InetSocketAddress) address).getPort());
     } else if (address.getClass().getName().equals("io.netty.channel.unix.DomainSocketAddress")) {
       // To avoid a compile time dependency on grpc-netty, we check against the runtime class name.
-      builder.setType(Type.TYPE_UNIX)
+      builder.setType(Address.Type.TYPE_UNIX)
           .setAddress(address.toString());
     } else {
-      builder.setType(Type.TYPE_UNKNOWN).setAddress(address.toString());
+      builder.setType(Address.Type.TYPE_UNKNOWN).setAddress(address.toString());
     }
     return builder.build();
   }

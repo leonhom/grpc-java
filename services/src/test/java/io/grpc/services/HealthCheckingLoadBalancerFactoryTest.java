@@ -34,8 +34,8 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
-import static org.mockito.Mockito.verifyZeroInteractions;
 import static org.mockito.Mockito.when;
 
 import com.google.common.util.concurrent.MoreExecutors;
@@ -49,7 +49,6 @@ import io.grpc.Context.CancellationListener;
 import io.grpc.EquivalentAddressGroup;
 import io.grpc.LoadBalancer;
 import io.grpc.LoadBalancer.CreateSubchannelArgs;
-import io.grpc.LoadBalancer.Factory;
 import io.grpc.LoadBalancer.Helper;
 import io.grpc.LoadBalancer.ResolvedAddresses;
 import io.grpc.LoadBalancer.Subchannel;
@@ -69,7 +68,6 @@ import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.internal.BackoffPolicy;
 import io.grpc.internal.FakeClock;
-import io.grpc.internal.GrpcAttributes;
 import io.grpc.internal.ServiceConfigUtil;
 import io.grpc.services.HealthCheckingLoadBalancerFactory.SubchannelImpl;
 import io.grpc.stub.StreamObserver;
@@ -132,8 +130,8 @@ public class HealthCheckingLoadBalancerFactoryTest {
   private final Helper origHelper = mock(Helper.class, delegatesTo(new FakeHelper()));
   // The helper seen by the origLb
   private Helper wrappedHelper;
-  private final Factory origLbFactory =
-      mock(Factory.class, delegatesTo(new Factory() {
+  private final LoadBalancer.Factory origLbFactory =
+      mock(LoadBalancer.Factory.class, delegatesTo(new LoadBalancer.Factory() {
           @Override
           public LoadBalancer newLoadBalancer(Helper helper) {
             checkState(wrappedHelper == null, "LoadBalancer already created");
@@ -365,7 +363,7 @@ public class HealthCheckingLoadBalancerFactoryTest {
       assertThat(healthImpls[i].calls).hasSize(1);
     }
 
-    verifyZeroInteractions(backoffPolicyProvider);
+    verifyNoInteractions(backoffPolicyProvider);
   }
 
   @Test
@@ -434,7 +432,7 @@ public class HealthCheckingLoadBalancerFactoryTest {
         unavailableStateWithMsg("Health-check service responded SERVICE_UNKNOWN for 'BarService'"));
 
     verifyNoMoreInteractions(origLb, mockStateListeners[0], mockStateListeners[1]);
-    verifyZeroInteractions(backoffPolicyProvider);
+    verifyNoInteractions(backoffPolicyProvider);
   }
 
   @Test
@@ -978,30 +976,21 @@ public class HealthCheckingLoadBalancerFactoryTest {
   }
 
   @Test
-  public void getHealthCheckedServiceName_nullServiceConfig() {
+  public void getHealthCheckedServiceName_nullHealthCheckConfig() {
     assertThat(ServiceConfigUtil.getHealthCheckedServiceName(null)).isNull();
   }
 
   @Test
-  public void getHealthCheckedServiceName_noHealthCheckConfig() {
-    assertThat(ServiceConfigUtil.getHealthCheckedServiceName(new HashMap<String, Void>())).isNull();
-  }
-
-  @Test
-  public void getHealthCheckedServiceName_healthCheckConfigMissingServiceName() {
-    HashMap<String, Object> serviceConfig = new HashMap<>();
+  public void getHealthCheckedServiceName_missingServiceName() {
     HashMap<String, Object> hcConfig = new HashMap<>();
-    serviceConfig.put("healthCheckConfig", hcConfig);
-    assertThat(ServiceConfigUtil.getHealthCheckedServiceName(serviceConfig)).isNull();
+    assertThat(ServiceConfigUtil.getHealthCheckedServiceName(hcConfig)).isNull();
   }
 
   @Test
   public void getHealthCheckedServiceName_healthCheckConfigHasServiceName() {
-    HashMap<String, Object> serviceConfig = new HashMap<>();
     HashMap<String, Object> hcConfig = new HashMap<>();
     hcConfig.put("serviceName", "FooService");
-    serviceConfig.put("healthCheckConfig", hcConfig);
-    assertThat(ServiceConfigUtil.getHealthCheckedServiceName(serviceConfig))
+    assertThat(ServiceConfigUtil.getHealthCheckedServiceName(hcConfig))
         .isEqualTo("FooService");
   }
 
@@ -1066,8 +1055,8 @@ public class HealthCheckingLoadBalancerFactoryTest {
 
   @Test
   public void util_newHealthCheckingLoadBalancer() {
-    Factory hcFactory =
-        new Factory() {
+    LoadBalancer.Factory hcFactory =
+        new LoadBalancer.Factory() {
           @Override
           public LoadBalancer newLoadBalancer(Helper helper) {
             return HealthCheckingLoadBalancerUtil.newHealthCheckingLoadBalancer(
@@ -1095,12 +1084,11 @@ public class HealthCheckingLoadBalancerFactoryTest {
   }
 
   private Attributes attrsWithHealthCheckService(@Nullable String serviceName) {
-    HashMap<String, Object> serviceConfig = new HashMap<>();
     HashMap<String, Object> hcConfig = new HashMap<>();
     hcConfig.put("serviceName", serviceName);
-    serviceConfig.put("healthCheckConfig", hcConfig);
     return Attributes.newBuilder()
-        .set(GrpcAttributes.NAME_RESOLVER_SERVICE_CONFIG, serviceConfig).build();
+        .set(LoadBalancer.ATTR_HEALTH_CHECKING_CONFIG, hcConfig)
+        .build();
   }
 
   private HealthCheckRequest makeRequest(String service) {

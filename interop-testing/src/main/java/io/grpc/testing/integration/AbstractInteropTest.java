@@ -49,6 +49,7 @@ import io.grpc.ClientStreamTracer;
 import io.grpc.Context;
 import io.grpc.Grpc;
 import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.Server;
@@ -61,9 +62,9 @@ import io.grpc.ServerStreamTracer;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.auth.MoreCallCredentials;
+import io.grpc.census.InternalCensusStatsAccessor;
+import io.grpc.census.internal.DeprecatedCensusConstants;
 import io.grpc.internal.AbstractServerImplBuilder;
-import io.grpc.internal.CensusStatsModule;
-import io.grpc.internal.DeprecatedCensusConstants;
 import io.grpc.internal.GrpcUtil;
 import io.grpc.internal.testing.StatsTestUtils;
 import io.grpc.internal.testing.StatsTestUtils.FakeStatsRecorder;
@@ -153,6 +154,8 @@ public abstract class AbstractInteropTest {
 
   private final AtomicReference<ServerCall<?, ?>> serverCallCapture =
       new AtomicReference<>();
+  private final AtomicReference<ClientCall<?, ?>> clientCallCapture =
+      new AtomicReference<>();
   private final AtomicReference<Metadata> requestHeadersCapture =
       new AtomicReference<>();
   private final AtomicReference<Context> contextCapture =
@@ -190,7 +193,7 @@ public abstract class AbstractInteropTest {
   /**
    * Constructor for tests.
    */
-  public AbstractInteropTest() {
+  protected AbstractInteropTest() {
     TestRule timeout = Timeout.seconds(60);
     try {
       timeout = new DisableOnDebug(timeout);
@@ -238,15 +241,15 @@ public abstract class AbstractInteropTest {
         .addStreamTracerFactory(serverStreamTracerFactory);
     if (builder instanceof AbstractServerImplBuilder) {
       customCensusModulePresent = true;
+      ServerStreamTracer.Factory censusTracerFactory =
+          InternalCensusStatsAccessor
+              .getServerStreamTracerFactory(
+                  tagger, tagContextBinarySerializer, serverStatsRecorder,
+                  GrpcUtil.STOPWATCH_SUPPLIER,
+                  true, true, true, false /* real-time metrics */);
       AbstractServerImplBuilder<?> sb = (AbstractServerImplBuilder<?>) builder;
-      io.grpc.internal.TestingAccessor.setStatsImplementation(
-          sb,
-          new CensusStatsModule(
-              tagger,
-              tagContextBinarySerializer,
-              serverStatsRecorder,
-              GrpcUtil.STOPWATCH_SUPPLIER,
-              true, true, true, false /* real-time metrics */));
+      io.grpc.internal.TestingAccessor.setStatsEnabled(sb, false);
+      sb.addStreamTracerFactory(censusTracerFactory);
     }
     if (metricsExpected()) {
       assertThat(builder).isInstanceOf(AbstractServerImplBuilder.class);
@@ -335,7 +338,11 @@ public abstract class AbstractInteropTest {
     stopServer();
   }
 
-  protected abstract ManagedChannel createChannel();
+  protected ManagedChannel createChannel() {
+    return createChannelBuilder().build();
+  }
+
+  protected abstract ManagedChannelBuilder<?> createChannelBuilder();
 
   @Nullable
   protected ClientInterceptor[] getAdditionalInterceptors() {
@@ -351,10 +358,13 @@ public abstract class AbstractInteropTest {
     return null;
   }
 
-  protected final CensusStatsModule createClientCensusStatsModule() {
-    return new CensusStatsModule(
-        tagger, tagContextBinarySerializer, clientStatsRecorder, GrpcUtil.STOPWATCH_SUPPLIER,
-        true, true, true, false /* real-time metrics */);
+  protected final ClientInterceptor createCensusStatsClientInterceptor() {
+    return
+        InternalCensusStatsAccessor
+            .getClientInterceptor(
+                tagger, tagContextBinarySerializer, clientStatsRecorder,
+                GrpcUtil.STOPWATCH_SUPPLIER,
+                true, true, true, false /* real-time metrics */);
   }
 
   /**
@@ -369,8 +379,17 @@ public abstract class AbstractInteropTest {
     assertEquals(EMPTY, blockingStub.emptyCall(EMPTY));
   }
 
+  @Test
+  public void emptyUnaryWithRetriableStream() throws Exception {
+    channel.shutdown();
+    channel = createChannelBuilder().enableRetry().build();
+    assertEquals(EMPTY, TestServiceGrpc.newBlockingStub(channel).emptyCall(EMPTY));
+  }
+
   /** Sends a cacheable unary rpc using GET. Requires that the server is behind a caching proxy. */
   public void cacheableUnary() {
+    // THIS TEST IS BROKEN. Enabling safe just on the MethodDescriptor does nothing by itself. This
+    // test would need to enable GET on the channel.
     // Set safe to true.
     MethodDescriptor<SimpleRequest, SimpleResponse> safeCacheableUnaryCallMethod =
         TestServiceGrpc.getCacheableUnaryCallMethod().toBuilder().setSafe(true).build();
@@ -405,6 +424,7 @@ public abstract class AbstractInteropTest {
 
     assertEquals(response1, response2);
     assertNotEquals(response1, response3);
+    // THIS TEST IS BROKEN. See comment at start of method.
   }
 
   @Test
@@ -782,6 +802,8 @@ public abstract class AbstractInteropTest {
         = asyncStub.fullDuplexCall(responseObserver);
     requestObserver.onCompleted();
     responseObserver.awaitCompletion(operationTimeoutMillis(), TimeUnit.MILLISECONDS);
+    assertSuccess(responseObserver);
+    assertTrue("Expected an empty stream", responseObserver.getValues().isEmpty());
   }
 
   @Test
@@ -1092,7 +1114,7 @@ public abstract class AbstractInteropTest {
     // warm up the channel and JVM
     blockingStub.emptyCall(Empty.getDefaultInstance());
     TestServiceGrpc.TestServiceBlockingStub stub =
-        blockingStub.withDeadlineAfter(100, TimeUnit.MILLISECONDS);
+        blockingStub.withDeadlineAfter(1, TimeUnit.SECONDS);
     StreamingOutputCallRequest request = StreamingOutputCallRequest.newBuilder()
         .addResponseParameters(ResponseParameters.newBuilder()
             .setIntervalUs((int) TimeUnit.SECONDS.toMicros(20)))
@@ -1106,7 +1128,7 @@ public abstract class AbstractInteropTest {
       assertTrue(desc,
           // There is a race between client and server-side deadline expiration.
           // If client expires first, it'd generate this message
-          Pattern.matches("deadline exceeded after .*ns. \\[.*\\]", desc)
+          Pattern.matches("deadline exceeded after .*s. \\[.*\\]", desc)
           // If server expires first, it'd reset the stream and client would generate a different
           // message
           || desc.startsWith("ClientCall was cancelled at or after deadline."));
@@ -1654,6 +1676,16 @@ public abstract class AbstractInteropTest {
     }
   }
 
+  /**
+   * Verifies remote server address and local client address are available from ClientCall
+   * Attributes via ClientInterceptor.
+   */
+  @Test
+  public void getServerAddressAndLocalAddressFromClient() {
+    assertNotNull(obtainRemoteServerAddr());
+    assertNotNull(obtainLocalClientAddr());
+  }
+
   /** Sends a large unary rpc with service account credentials. */
   public void serviceAccountCreds(String jsonKey, InputStream credentialsStream, String authScope)
       throws Exception {
@@ -1826,14 +1858,36 @@ public abstract class AbstractInteropTest {
     return serverCallCapture.get().getAttributes().get(Grpc.TRANSPORT_ATTR_REMOTE_ADDR);
   }
 
+  /** Helper for getting remote address from {@link io.grpc.ClientCall#getAttributes()} */
+  protected SocketAddress obtainRemoteServerAddr() {
+    TestServiceGrpc.TestServiceBlockingStub stub = blockingStub
+        .withInterceptors(recordClientCallInterceptor(clientCallCapture))
+        .withDeadlineAfter(5, TimeUnit.SECONDS);
+
+    stub.unaryCall(SimpleRequest.getDefaultInstance());
+
+    return clientCallCapture.get().getAttributes().get(Grpc.TRANSPORT_ATTR_REMOTE_ADDR);
+  }
+
   /** Helper for getting local address from {@link io.grpc.ServerCall#getAttributes()} */
-  protected SocketAddress obtainLocalClientAddr() {
+  protected SocketAddress obtainLocalServerAddr() {
     TestServiceGrpc.TestServiceBlockingStub stub =
         blockingStub.withDeadlineAfter(5, TimeUnit.SECONDS);
 
     stub.unaryCall(SimpleRequest.getDefaultInstance());
 
     return serverCallCapture.get().getAttributes().get(Grpc.TRANSPORT_ATTR_LOCAL_ADDR);
+  }
+
+  /** Helper for getting local address from {@link io.grpc.ClientCall#getAttributes()} */
+  protected SocketAddress obtainLocalClientAddr() {
+    TestServiceGrpc.TestServiceBlockingStub stub = blockingStub
+        .withInterceptors(recordClientCallInterceptor(clientCallCapture))
+        .withDeadlineAfter(5, TimeUnit.SECONDS);
+
+    stub.unaryCall(SimpleRequest.getDefaultInstance());
+
+    return clientCallCapture.get().getAttributes().get(Grpc.TRANSPORT_ATTR_LOCAL_ADDR);
   }
 
   /** Helper for asserting TLS info in SSLSession {@link io.grpc.ServerCall#getAttributes()} */
@@ -1867,7 +1921,7 @@ public abstract class AbstractInteropTest {
    * Some tests run on memory constrained environments.  Rather than OOM, just give up.  64 is
    * chosen as a maximum amount of memory a large test would need.
    */
-  private static void assumeEnoughMemory() {
+  protected static void assumeEnoughMemory() {
     Runtime r = Runtime.getRuntime();
     long usedMem = r.totalMemory() - r.freeMemory();
     long actuallyFreeMemory = r.maxMemory() - usedMem;
@@ -2148,6 +2202,23 @@ public abstract class AbstractInteropTest {
           ServerCallHandler<ReqT, RespT> next) {
         serverCallCapture.set(call);
         return next.startCall(call, requestHeaders);
+      }
+    };
+  }
+
+  /**
+   * Captures the request attributes. Useful for testing ClientCalls.
+   * {@link ClientCall#getAttributes()}
+   */
+  private static ClientInterceptor recordClientCallInterceptor(
+      final AtomicReference<ClientCall<?, ?>> clientCallCapture) {
+    return new ClientInterceptor() {
+      @Override
+      public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+          MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
+        ClientCall<ReqT, RespT> clientCall = next.newCall(method,callOptions);
+        clientCallCapture.set(clientCall);
+        return clientCall;
       }
     };
   }

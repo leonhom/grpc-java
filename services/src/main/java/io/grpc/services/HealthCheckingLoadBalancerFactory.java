@@ -35,7 +35,6 @@ import io.grpc.ClientCall;
 import io.grpc.ConnectivityStateInfo;
 import io.grpc.LoadBalancer;
 import io.grpc.LoadBalancer.CreateSubchannelArgs;
-import io.grpc.LoadBalancer.Factory;
 import io.grpc.LoadBalancer.Helper;
 import io.grpc.LoadBalancer.Subchannel;
 import io.grpc.LoadBalancer.SubchannelStateListener;
@@ -49,7 +48,6 @@ import io.grpc.health.v1.HealthCheckResponse;
 import io.grpc.health.v1.HealthCheckResponse.ServingStatus;
 import io.grpc.health.v1.HealthGrpc;
 import io.grpc.internal.BackoffPolicy;
-import io.grpc.internal.GrpcAttributes;
 import io.grpc.internal.ServiceConfigUtil;
 import io.grpc.util.ForwardingLoadBalancer;
 import io.grpc.util.ForwardingLoadBalancerHelper;
@@ -70,16 +68,16 @@ import javax.annotation.Nullable;
  * <p>Note the original LoadBalancer must call {@code Helper.createSubchannel()} from the
  * SynchronizationContext, or it will throw.
  */
-final class HealthCheckingLoadBalancerFactory extends Factory {
+final class HealthCheckingLoadBalancerFactory extends LoadBalancer.Factory {
   private static final Logger logger =
       Logger.getLogger(HealthCheckingLoadBalancerFactory.class.getName());
 
-  private final Factory delegateFactory;
+  private final LoadBalancer.Factory delegateFactory;
   private final BackoffPolicy.Provider backoffPolicyProvider;
   private final Supplier<Stopwatch> stopwatchSupplier;
 
   public HealthCheckingLoadBalancerFactory(
-      Factory delegateFactory, BackoffPolicy.Provider backoffPolicyProvider,
+      LoadBalancer.Factory delegateFactory, BackoffPolicy.Provider backoffPolicyProvider,
       Supplier<Stopwatch> stopwatchSupplier) {
     this.delegateFactory = checkNotNull(delegateFactory, "delegateFactory");
     this.backoffPolicyProvider = checkNotNull(backoffPolicyProvider, "backoffPolicyProvider");
@@ -182,9 +180,11 @@ final class HealthCheckingLoadBalancerFactory extends Factory {
 
     @Override
     public void handleResolvedAddresses(ResolvedAddresses resolvedAddresses) {
-      Map<String, ?> serviceConfig =
-          resolvedAddresses.getAttributes().get(GrpcAttributes.NAME_RESOLVER_SERVICE_CONFIG);
-      String serviceName = ServiceConfigUtil.getHealthCheckedServiceName(serviceConfig);
+      Map<String, ?> healthCheckingConfig =
+          resolvedAddresses
+              .getAttributes()
+              .get(LoadBalancer.ATTR_HEALTH_CHECKING_CONFIG);
+      String serviceName = ServiceConfigUtil.getHealthCheckedServiceName(healthCheckingConfig);
       helper.setHealthCheckedService(serviceName);
       super.handleResolvedAddresses(resolvedAddresses);
     }

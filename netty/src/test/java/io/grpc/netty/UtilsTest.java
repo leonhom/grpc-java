@@ -29,9 +29,11 @@ import io.grpc.Metadata;
 import io.grpc.Status;
 import io.grpc.internal.GrpcUtil;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelFactory;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ConnectTimeoutException;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.ServerChannel;
 import io.netty.channel.WriteBufferWaterMark;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
@@ -40,6 +42,7 @@ import io.netty.handler.codec.http2.Http2Error;
 import io.netty.handler.codec.http2.Http2Exception;
 import io.netty.handler.codec.http2.Http2Headers;
 import io.netty.util.AsciiString;
+import java.nio.channels.UnresolvedAddressException;
 import java.util.Map;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -58,6 +61,8 @@ public class UtilsTest {
     assertSame(s, Utils.statusFromThrowable(new Exception(s.asException())));
     Throwable t;
     t = new ConnectTimeoutException("msg");
+    assertStatusEquals(Status.UNAVAILABLE.withCause(t), Utils.statusFromThrowable(t));
+    t = new UnresolvedAddressException();
     assertStatusEquals(Status.UNAVAILABLE.withCause(t), Utils.statusFromThrowable(t));
     t = new Http2Exception(Http2Error.INTERNAL_ERROR, "msg");
     assertStatusEquals(Status.INTERNAL.withCause(t), Utils.statusFromThrowable(t));
@@ -204,13 +209,13 @@ public class UtilsTest {
   }
 
   @Test
-  public void defaultServerChannelType_whenEpollIsAvailable() {
+  public void defaultServerChannelFactory_whenEpollIsAvailable() {
     assume().that(Utils.isEpollAvailable()).isTrue();
 
-    Class<? extends Channel> clientChannelType = Utils.DEFAULT_SERVER_CHANNEL_TYPE;
+    ChannelFactory<? extends ServerChannel> channelFactory = Utils.DEFAULT_SERVER_CHANNEL_FACTORY;
 
-    assertThat(clientChannelType.getName())
-        .isEqualTo("io.netty.channel.epoll.EpollServerSocketChannel");
+    assertThat(channelFactory.toString())
+        .isEqualTo("ReflectiveChannelFactory(EpollServerSocketChannel.class)");
   }
 
   @Test

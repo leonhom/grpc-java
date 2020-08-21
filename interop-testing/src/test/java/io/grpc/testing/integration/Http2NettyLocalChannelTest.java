@@ -16,7 +16,6 @@
 
 package io.grpc.testing.integration;
 
-import io.grpc.ManagedChannel;
 import io.grpc.internal.AbstractServerImplBuilder;
 import io.grpc.netty.NegotiationType;
 import io.grpc.netty.NettyChannelBuilder;
@@ -49,7 +48,7 @@ public class Http2NettyLocalChannelTest extends AbstractInteropTest {
   }
 
   @Override
-  protected ManagedChannel createChannel() {
+  protected NettyChannelBuilder createChannelBuilder() {
     NettyChannelBuilder builder = NettyChannelBuilder
         .forAddress(new LocalAddress("in-process-1"))
         .negotiationType(NegotiationType.PLAINTEXT)
@@ -57,9 +56,9 @@ public class Http2NettyLocalChannelTest extends AbstractInteropTest {
         .eventLoopGroup(eventLoopGroup)
         .flowControlWindow(65 * 1024)
         .maxInboundMessageSize(AbstractInteropTest.MAX_MESSAGE_SIZE);
-    io.grpc.internal.TestingAccessor.setStatsImplementation(
-        builder, createClientCensusStatsModule());
-    return builder.build();
+    // Disable the default census stats interceptor, use testing interceptor instead.
+    io.grpc.internal.TestingAccessor.setStatsEnabled(builder, false);
+    return builder.intercept(createCensusStatsClientInterceptor());
   }
 
   @Override

@@ -18,9 +18,9 @@ package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 
+import com.github.udpa.udpa.data.orca.v1.OrcaLoadReport;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
-import io.envoyproxy.udpa.data.orca.v1.OrcaLoadReport;
 import io.grpc.ClientStreamTracer;
 import io.grpc.ClientStreamTracer.StreamInfo;
 import io.grpc.LoadBalancer.PickResult;
@@ -54,27 +54,10 @@ final class ClientLoadCounter {
   private final AtomicLong callsIssued = new AtomicLong();
   private final MetricRecorder[] metricRecorders = new MetricRecorder[THREAD_BALANCING_FACTOR];
 
-  // True if this counter continues to record stats after next snapshot. Otherwise, it will be
-  // discarded.
-  private boolean active;
-
   ClientLoadCounter() {
     for (int i = 0; i < THREAD_BALANCING_FACTOR; i++) {
       metricRecorders[i] = new MetricRecorder();
     }
-    active = true;
-  }
-
-  /**
-   * Must only be used for testing.
-   */
-  @VisibleForTesting
-  ClientLoadCounter(long callsSucceeded, long callsInProgress, long callsFailed, long callsIssued) {
-    this();
-    this.callsSucceeded.set(callsSucceeded);
-    this.callsInProgress.set(callsInProgress);
-    this.callsFailed.set(callsFailed);
-    this.callsIssued.set(callsIssued);
   }
 
   void recordCallStarted() {
@@ -98,12 +81,8 @@ final class ClientLoadCounter {
   }
 
   /**
-   * Generates a snapshot for load stats recorded in this counter. Successive snapshots represent
-   * load stats recorded for the interval since the previous snapshot. So taking a snapshot clears
-   * the counter state except for ongoing RPC recordings.
-   *
-   * <p>This method is not thread-safe and must be called from {@link
-   * io.grpc.LoadBalancer.Helper#getSynchronizationContext()}.
+   * Generates a snapshot for load stats recorded in this counter for the interval between calls
+   * of this method.
    */
   ClientLoadSnapshot snapshot() {
     Map<String, MetricValue> aggregatedValues = new HashMap<>();
@@ -127,12 +106,24 @@ final class ClientLoadCounter {
         aggregatedValues);
   }
 
-  void setActive(boolean value) {
-    active = value;
+  @VisibleForTesting
+  void setCallsIssued(long callsIssued) {
+    this.callsIssued.set(callsIssued);
   }
 
-  boolean isActive() {
-    return active;
+  @VisibleForTesting
+  void setCallsInProgress(long callsInProgress) {
+    this.callsInProgress.set(callsInProgress);
+  }
+
+  @VisibleForTesting
+  void setCallsSucceeded(long callsSucceeded) {
+    this.callsSucceeded.set(callsSucceeded);
+  }
+
+  @VisibleForTesting
+  void setCallsFailed(long callsFailed) {
+    this.callsFailed.set(callsFailed);
   }
 
   /**
@@ -413,6 +404,13 @@ final class ClientLoadCounter {
         ClientStreamTracer.Factory originFactory) {
       return new LoadRecordingStreamTracerFactory(counter, originFactory);
     }
+
+    @Override
+    public String toString() {
+      return MoreObjects.toStringHelper(LoadRecordingSubchannelPicker.class)
+          .add("delegate", delegate)
+          .toString();
+    }
   }
 
   /**
@@ -444,6 +442,13 @@ final class ClientLoadCounter {
     protected ClientStreamTracer.Factory wrapTracerFactory(
         ClientStreamTracer.Factory originFactory) {
       return orcaPerRequestUtil.newOrcaClientStreamTracerFactory(originFactory, listener);
+    }
+
+    @Override
+    public String toString() {
+      return MoreObjects.toStringHelper(MetricsObservingSubchannelPicker.class)
+          .add("delegate", delegate)
+          .toString();
     }
   }
 }

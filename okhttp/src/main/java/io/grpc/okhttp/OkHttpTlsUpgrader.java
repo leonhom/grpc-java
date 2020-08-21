@@ -43,10 +43,10 @@ final class OkHttpTlsUpgrader {
    */
   @VisibleForTesting
   static final List<Protocol> TLS_PROTOCOLS =
-      Collections.unmodifiableList(Arrays.asList(Protocol.GRPC_EXP, Protocol.HTTP_2));
+      Collections.unmodifiableList(Arrays.asList(Protocol.HTTP_2));
 
   /**
-   * Upgrades given Socket to be a SSLSocket.
+   * Upgrades given Socket to be an SSLSocket.
    *
    * @throws IOException if an IO error was encountered during the upgrade handshake.
    * @throws RuntimeException if the upgrade negotiation failed.
@@ -85,7 +85,7 @@ final class OkHttpTlsUpgrader {
    * @see <a href="https://www.ietf.org/rfc/rfc2732.txt">RFC2732</a>
    * @see <a href="https://tools.ietf.org/html/rfc5280#section-4.2.1.6">RFC5280</a>
    *
-   * @return {@param host} in a form consistent with X509 certificates
+   * @return {@code host} in a form consistent with X509 certificates
    */
   @VisibleForTesting
   static String canonicalizeHost(String host) {

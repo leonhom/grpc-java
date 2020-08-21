@@ -23,11 +23,11 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
-import static org.mockito.Mockito.verifyZeroInteractions;
 import static org.mockito.Mockito.when;
 
-import io.envoyproxy.udpa.data.orca.v1.OrcaLoadReport;
+import com.github.udpa.udpa.data.orca.v1.OrcaLoadReport;
 import io.grpc.ClientStreamTracer;
 import io.grpc.Metadata;
 import io.grpc.xds.OrcaPerRequestUtil.OrcaPerRequestReportListener;
@@ -164,7 +164,7 @@ public class OrcaPerRequestUtilTest {
         OrcaLoadReport.getDefaultInstance());
     parentTracer.inboundTrailers(trailer);
     verify(orcaListener1).onLoadReport(eq(OrcaLoadReport.getDefaultInstance()));
-    verifyZeroInteractions(childFactory);
-    verifyZeroInteractions(orcaListener2);
+    verifyNoInteractions(childFactory);
+    verifyNoInteractions(orcaListener2);
   }
 }

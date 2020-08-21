@@ -43,7 +43,6 @@ import io.netty.channel.EventLoop;
 import io.netty.handler.codec.http2.Http2Headers;
 import io.netty.handler.codec.http2.Http2Stream;
 import io.netty.util.AsciiString;
-import io.perfmark.Link;
 import io.perfmark.PerfMark;
 import io.perfmark.Tag;
 import javax.annotation.Nullable;
@@ -54,13 +53,14 @@ import javax.annotation.Nullable;
  */
 class NettyClientStream extends AbstractClientStream {
   private static final InternalMethodDescriptor methodDescriptorAccessor =
-      new InternalMethodDescriptor(InternalKnownTransport.NETTY);
+      new InternalMethodDescriptor(
+          NettyClientTransport.class.getName().contains("grpc.netty.shaded")
+              ? InternalKnownTransport.NETTY_SHADED : InternalKnownTransport.NETTY);
 
   private final Sink sink = new Sink();
   private final TransportState state;
   private final WriteQueue writeQueue;
   private final MethodDescriptor<?, ?> method;
-  private final Channel channel;
   private AsciiString authority;
   private final AsciiString scheme;
   private final AsciiString userAgent;
@@ -75,18 +75,18 @@ class NettyClientStream extends AbstractClientStream {
       AsciiString userAgent,
       StatsTraceContext statsTraceCtx,
       TransportTracer transportTracer,
-      CallOptions callOptions) {
+      CallOptions callOptions,
+      boolean useGetForSafeMethods) {
     super(
         new NettyWritableBufferAllocator(channel.alloc()),
         statsTraceCtx,
         transportTracer,
         headers,
         callOptions,
-        useGet(method));
+        useGetForSafeMethods && method.isSafe());
     this.state = checkNotNull(state, "transportState");
     this.writeQueue = state.handler.getWriteQueue();
     this.method = checkNotNull(method, "method");
-    this.channel = checkNotNull(channel, "channel");
     this.authority = checkNotNull(authority, "authority");
     this.scheme = checkNotNull(scheme, "scheme");
     this.userAgent = userAgent;
@@ -110,10 +110,6 @@ class NettyClientStream extends AbstractClientStream {
   @Override
   public Attributes getAttributes() {
     return state.handler.getAttributes();
-  }
-
-  private static boolean useGet(MethodDescriptor<?, ?> method) {
-    return method.isSafe();
   }
 
   private class Sink implements AbstractClientStream.Sink {
@@ -212,41 +208,6 @@ class NettyClientStream extends AbstractClientStream {
       }
     }
 
-    private void requestInternal(final int numMessages) {
-      if (channel.eventLoop().inEventLoop()) {
-        // Processing data read in the event loop so can call into the deframer immediately
-        transportState().requestMessagesFromDeframer(numMessages);
-      } else {
-        channel.eventLoop().execute(new Runnable() {
-          final Link link = PerfMark.linkOut();
-          @Override
-          public void run() {
-            PerfMark.startTask(
-                "NettyClientStream$Sink.requestMessagesFromDeframer",
-                transportState().tag());
-            PerfMark.linkIn(link);
-            try {
-              transportState().requestMessagesFromDeframer(numMessages);
-            } finally {
-              PerfMark.stopTask(
-                  "NettyClientStream$Sink.requestMessagesFromDeframer",
-                  transportState().tag());
-            }
-          }
-        });
-      }
-    }
-
-    @Override
-    public void request(int numMessages) {
-      PerfMark.startTask("NettyClientStream$Sink.request");
-      try {
-        requestInternal(numMessages);
-      } finally {
-        PerfMark.stopTask("NettyClientStream$Sink.request");
-      }
-    }
-
     @Override
     public void cancel(Status status) {
       PerfMark.startTask("NettyClientStream$Sink.cancel");
@@ -270,7 +231,7 @@ class NettyClientStream extends AbstractClientStream {
     private Http2Stream http2Stream;
     private Tag tag;
 
-    public TransportState(
+    protected TransportState(
         NettyClientHandler handler,
         EventLoop eventLoop,
         int maxMessageSize,

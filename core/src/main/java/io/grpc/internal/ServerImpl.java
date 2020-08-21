@@ -131,7 +131,7 @@ public final class ServerImpl extends io.grpc.Server implements InternalInstrume
    * Construct a server.
    *
    * @param builder builder with configuration for server
-   * @param transportServer transport server that will create new incoming transports
+   * @param transportServers transport servers that will create new incoming transports
    * @param rootContext context that callbacks for new RPCs should be derived from
    */
   ServerImpl(
@@ -161,7 +161,6 @@ public final class ServerImpl extends io.grpc.Server implements InternalInstrume
     this.channelz = builder.channelz;
     this.serverCallTracer = builder.callTracerFactory.create();
     this.ticker = checkNotNull(builder.ticker, "ticker");
-
     channelz.addServer(this);
   }
 
@@ -481,11 +480,21 @@ public final class ServerImpl extends io.grpc.Server implements InternalInstrume
 
     private void streamCreatedInternal(
         final ServerStream stream, final String methodName, final Metadata headers, final Tag tag) {
+      final Executor wrappedExecutor;
+      // This is a performance optimization that avoids the synchronization and queuing overhead
+      // that comes with SerializingExecutor.
+      if (executor == directExecutor()) {
+        wrappedExecutor = new SerializeReentrantCallsDirectExecutor();
+        stream.optimizeForDirectExecutor();
+      } else {
+        wrappedExecutor = new SerializingExecutor(executor);
+      }
 
       if (headers.containsKey(MESSAGE_ENCODING_KEY)) {
         String encoding = headers.get(MESSAGE_ENCODING_KEY);
         Decompressor decompressor = decompressorRegistry.lookupDecompressor(encoding);
         if (decompressor == null) {
+          stream.setListener(NOOP_LISTENER);
           stream.close(
               Status.UNIMPLEMENTED.withDescription(
                   String.format("Can't find decompressor for %s", encoding)),
@@ -498,15 +507,7 @@ public final class ServerImpl extends io.grpc.Server implements InternalInstrume
       final StatsTraceContext statsTraceCtx = Preconditions.checkNotNull(
           stream.statsTraceContext(), "statsTraceCtx not present from stream");
 
-      final Context.CancellableContext context = createContext(stream, headers, statsTraceCtx);
-      final Executor wrappedExecutor;
-      // This is a performance optimization that avoids the synchronization and queuing overhead
-      // that comes with SerializingExecutor.
-      if (executor == directExecutor()) {
-        wrappedExecutor = new SerializeReentrantCallsDirectExecutor();
-      } else {
-        wrappedExecutor = new SerializingExecutor(executor);
-      }
+      final Context.CancellableContext context = createContext(headers, statsTraceCtx);
 
       final Link link = PerfMark.linkOut();
 
@@ -553,19 +554,31 @@ public final class ServerImpl extends io.grpc.Server implements InternalInstrume
               context.cancel(null);
               return;
             }
-            listener =
-                startCall(stream, methodName, method, headers, context, statsTraceCtx, tag);
-          } catch (RuntimeException e) {
-            stream.close(Status.fromThrowable(e), new Metadata());
+            listener = startCall(stream, methodName, method, headers, context, statsTraceCtx, tag);
+          } catch (Throwable t) {
+            stream.close(Status.fromThrowable(t), new Metadata());
             context.cancel(null);
-            throw e;
-          } catch (Error e) {
-            stream.close(Status.fromThrowable(e), new Metadata());
-            context.cancel(null);
-            throw e;
+            throw t;
           } finally {
             jumpListener.setListener(listener);
           }
+
+          // An extremely short deadline may expire before stream.setListener(jumpListener).
+          // This causes NPE as in issue: https://github.com/grpc/grpc-java/issues/6300
+          // Delay of setting cancellationListener to context will fix the issue.
+          final class ServerStreamCancellationListener implements Context.CancellationListener {
+            @Override
+            public void cancelled(Context context) {
+              Status status = statusFromCancelled(context);
+              if (DEADLINE_EXCEEDED.getCode().equals(status.getCode())) {
+                // This should rarely get run, since the client will likely cancel the stream
+                // before the timeout is reached.
+                stream.cancel(status);
+              }
+            }
+          }
+
+          context.addListener(new ServerStreamCancellationListener(), directExecutor());
         }
       }
 
@@ -573,10 +586,13 @@ public final class ServerImpl extends io.grpc.Server implements InternalInstrume
     }
 
     private Context.CancellableContext createContext(
-        final ServerStream stream, Metadata headers, StatsTraceContext statsTraceCtx) {
+        Metadata headers, StatsTraceContext statsTraceCtx) {
       Long timeoutNanos = headers.get(TIMEOUT_KEY);
 
-      Context baseContext = statsTraceCtx.serverFilterContext(rootContext);
+      Context baseContext =
+          statsTraceCtx
+              .serverFilterContext(rootContext)
+              .withValue(io.grpc.InternalServer.SERVER_CONTEXT_KEY, ServerImpl.this);
 
       if (timeoutNanos == null) {
         return baseContext.withCancellation();
@@ -586,19 +602,6 @@ public final class ServerImpl extends io.grpc.Server implements InternalInstrume
           baseContext.withDeadline(
               Deadline.after(timeoutNanos, NANOSECONDS, ticker),
               transport.getScheduledExecutorService());
-      final class ServerStreamCancellationListener implements Context.CancellationListener {
-        @Override
-        public void cancelled(Context context) {
-          Status status = statusFromCancelled(context);
-          if (DEADLINE_EXCEEDED.getCode().equals(status.getCode())) {
-            // This should rarely get run, since the client will likely cancel the stream before
-            // the timeout is reached.
-            stream.cancel(status);
-          }
-        }
-      }
-
-      context.addListener(new ServerStreamCancellationListener(), directExecutor());
 
       return context;
     }
@@ -755,9 +758,9 @@ public final class ServerImpl extends io.grpc.Server implements InternalInstrume
     /**
      * Like {@link ServerCall#close(Status, Metadata)}, but thread-safe for internal use.
      */
-    private void internalClose() {
+    private void internalClose(Throwable t) {
       // TODO(ejona86): this is not thread-safe :)
-      stream.close(Status.UNKNOWN, new Metadata());
+      stream.close(Status.UNKNOWN.withCause(t), new Metadata());
     }
 
     @Override
@@ -777,12 +780,9 @@ public final class ServerImpl extends io.grpc.Server implements InternalInstrume
           PerfMark.linkIn(link);
           try {
             getListener().messagesAvailable(producer);
-          } catch (RuntimeException e) {
-            internalClose();
-            throw e;
-          } catch (Error e) {
-            internalClose();
-            throw e;
+          } catch (Throwable t) {
+            internalClose(t);
+            throw t;
           } finally {
             PerfMark.stopTask("ServerCallListener(app).messagesAvailable", tag);
           }
@@ -812,12 +812,9 @@ public final class ServerImpl extends io.grpc.Server implements InternalInstrume
           PerfMark.linkIn(link);
           try {
             getListener().halfClosed();
-          } catch (RuntimeException e) {
-            internalClose();
-            throw e;
-          } catch (Error e) {
-            internalClose();
-            throw e;
+          } catch (Throwable t) {
+            internalClose(t);
+            throw t;
           } finally {
             PerfMark.stopTask("ServerCallListener(app).halfClosed", tag);
           }
@@ -886,12 +883,9 @@ public final class ServerImpl extends io.grpc.Server implements InternalInstrume
           PerfMark.linkIn(link);
           try {
             getListener().onReady();
-          } catch (RuntimeException e) {
-            internalClose();
-            throw e;
-          } catch (Error e) {
-            internalClose();
-            throw e;
+          } catch (Throwable t) {
+            internalClose(t);
+            throw t;
           } finally {
             PerfMark.stopTask("ServerCallListener(app).onReady", tag);
           }

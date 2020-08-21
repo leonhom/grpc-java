@@ -20,7 +20,6 @@
 
 package io.grpc.okhttp.internal;
 
-import io.grpc.internal.GrpcUtil;
 import java.io.IOException;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
@@ -158,8 +157,7 @@ public class Platform {
 
   /** Attempt to match the host runtime to a capable Platform implementation. */
   private static Platform findPlatform() {
-    Provider androidOrAppEngineProvider =
-        GrpcUtil.IS_RESTRICTED_APPENGINE ? getAppEngineProvider() : getAndroidSecurityProvider();
+    Provider androidOrAppEngineProvider = getAndroidSecurityProvider();
     if (androidOrAppEngineProvider != null) {
       // Attempt to find Android 2.3+ APIs.
       OptionalMethod<Socket> setUseSessionTickets
@@ -179,13 +177,13 @@ public class Platform {
         trafficStatsTagSocket = trafficStats.getMethod("tagSocket", Socket.class);
         trafficStatsUntagSocket = trafficStats.getMethod("untagSocket", Socket.class);
       } catch (ClassNotFoundException ignored) {
+        // On older Android
       } catch (NoSuchMethodException ignored) {
+        // On older Android
       }
 
       TlsExtensionType tlsExtensionType;
-      if (GrpcUtil.IS_RESTRICTED_APPENGINE) {
-        tlsExtensionType = TlsExtensionType.ALPN_AND_NPN;
-      } else if (androidOrAppEngineProvider.getName().equals("GmsCore_OpenSSL")
+      if (androidOrAppEngineProvider.getName().equals("GmsCore_OpenSSL")
           || androidOrAppEngineProvider.getName().equals("Conscrypt")
           || androidOrAppEngineProvider.getName().equals("Ssl_Guard")) {
         tlsExtensionType = TlsExtensionType.ALPN_AND_NPN;
@@ -248,10 +246,15 @@ public class Platform {
               });
       return new JdkAlpnPlatform(sslProvider, setApplicationProtocols, getApplicationProtocol);
     } catch (NoSuchAlgorithmException ignored) {
+      // On older Java
     } catch (KeyManagementException ignored) {
+      // On older Java
     } catch (PrivilegedActionException ignored) {
+      // On older Java
     } catch (IllegalAccessException ignored) {
+      // On older Java
     } catch (InvocationTargetException ignored) {
+      // On older Java
     }
 
     // Find Jetty's ALPN extension for OpenJDK.
@@ -268,7 +271,9 @@ public class Platform {
           putMethod, getMethod, removeMethod, clientProviderClass, serverProviderClass,
           sslProvider);
     } catch (ClassNotFoundException ignored) {
+      // No Jetty ALPN
     } catch (NoSuchMethodException ignored) {
+      // Weird Jetty ALPN
     }
 
     // TODO(ericgribkoff) Return null here
@@ -297,19 +302,6 @@ public class Platform {
       logger.log(Level.FINE, "Can't find class", e);
     }
     return false;
-  }
-
-  /**
-   * Forcibly load the conscrypt security provider on AppEngine if it's available. If not fail.
-   */
-  private static Provider getAppEngineProvider() {
-    try {
-      // Forcibly load conscrypt as it is unlikely to be an installed provider on AppEngine
-      return (Provider) Class.forName("org.conscrypt.OpenSSLProvider")
-          .getConstructor().newInstance();
-    } catch (Throwable t) {
-      throw new RuntimeException("Unable to load conscrypt security provider", t);
-    }
   }
 
   /**
@@ -529,7 +521,9 @@ public class Platform {
         removeMethod.invoke(null, sslSocket);
       } catch (IllegalAccessException ignored) {
         throw new AssertionError();
-      } catch (InvocationTargetException ignored) {
+      } catch (InvocationTargetException ex) {
+        // This would be very surprising and there's not much to do about it
+        logger.log(Level.FINE, "Failed to remove SSLSocket from Jetty ALPN", ex);
       }
     }
 

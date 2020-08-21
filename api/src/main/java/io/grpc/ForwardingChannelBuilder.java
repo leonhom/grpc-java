@@ -72,6 +72,12 @@ public abstract class ForwardingChannelBuilder<T extends ForwardingChannelBuilde
   }
 
   @Override
+  public T offloadExecutor(Executor executor) {
+    delegate().offloadExecutor(executor);
+    return thisT();
+  }
+
+  @Override
   public T intercept(List<ClientInterceptor> interceptors) {
     delegate().intercept(interceptors);
     return thisT();
@@ -95,16 +101,6 @@ public abstract class ForwardingChannelBuilder<T extends ForwardingChannelBuilde
     return thisT();
   }
 
-  /**
-   * @deprecated use {@link #usePlaintext()} instead.
-   */
-  @Override
-  @Deprecated
-  public T usePlaintext(boolean skipNegotiation) {
-    delegate().usePlaintext(skipNegotiation);
-    return thisT();
-  }
-
   @Override
   public T usePlaintext() {
     delegate().usePlaintext();
@@ -117,6 +113,7 @@ public abstract class ForwardingChannelBuilder<T extends ForwardingChannelBuilde
     return thisT();
   }
 
+  @Deprecated
   @Override
   public T nameResolverFactory(NameResolver.Factory resolverFactory) {
     delegate().nameResolverFactory(resolverFactory);
