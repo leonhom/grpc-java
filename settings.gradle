@@ -25,7 +25,7 @@ pluginManagement {
     }
 }
 
-rootProject.name = "leon-grpc"
+rootProject.name = "leon-grpc-java"
 include ":grpc-api"
 include ":grpc-core"
 include ":grpc-context"
