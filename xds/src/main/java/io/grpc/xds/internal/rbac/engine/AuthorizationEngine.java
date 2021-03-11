@@ -85,7 +85,7 @@ public class AuthorizationEngine {
    */
   public AuthorizationEngine(RBAC rbacPolicy) {
     Map<String, Expr> conditions = new LinkedHashMap<>();
-    for (Map.Entry<String, Policy> policy: rbacPolicy.getPolicies().entrySet()) {
+    for (Map.Entry<String, Policy> policy: rbacPolicy.getPoliciesMap().entrySet()) {
       conditions.put(policy.getKey(), policy.getValue().getCondition());
     }
     allowEngine = (rbacPolicy.getAction() == Action.ALLOW) 
@@ -102,18 +102,18 @@ public class AuthorizationEngine {
    * @param allowPolicy input Envoy RBAC policy with ALLOW action.
    * @throws IllegalArgumentException if the user inputs an invalid RBAC list.
    */
-  public AuthorizationEngine(RBAC denyPolicy, RBAC allowPolicy) throws IllegalArgumentException {
+  public AuthorizationEngine(RBAC denyPolicy, RBAC allowPolicy) {
     checkArgument(
         denyPolicy.getAction() == Action.DENY && allowPolicy.getAction() == Action.ALLOW,
         "Invalid RBAC list, " 
         + "must provide a RBAC with DENY action followed by a RBAC with ALLOW action. ");
     Map<String, Expr> denyConditions = new LinkedHashMap<>();
-    for (Map.Entry<String, Policy> policy: denyPolicy.getPolicies().entrySet()) {
+    for (Map.Entry<String, Policy> policy: denyPolicy.getPoliciesMap().entrySet()) {
       denyConditions.put(policy.getKey(), policy.getValue().getCondition());
     }
     denyEngine = new RbacEngine(Action.DENY, ImmutableMap.copyOf(denyConditions));
     Map<String, Expr> allowConditions = new LinkedHashMap<>();
-    for (Map.Entry<String, Policy> policy: allowPolicy.getPolicies().entrySet()) {
+    for (Map.Entry<String, Policy> policy: allowPolicy.getPoliciesMap().entrySet()) {
       allowConditions.put(policy.getKey(), policy.getValue().getCondition());
     }
     allowEngine = new RbacEngine(Action.ALLOW, ImmutableMap.copyOf(allowConditions));   
@@ -140,7 +140,7 @@ public class AuthorizationEngine {
       if (authzDecision != null) {
         return authzDecision;
       }
-      if (unknownPolicyNames.size() > 0) {
+      if (!unknownPolicyNames.isEmpty()) {
         return new AuthorizationDecision(
             AuthorizationDecision.Output.UNKNOWN, unknownPolicyNames);
       }
@@ -154,7 +154,7 @@ public class AuthorizationEngine {
       if (authzDecision != null) {
         return authzDecision;
       }
-      if (unknownPolicyNames.size() > 0) {
+      if (!unknownPolicyNames.isEmpty()) {
         return new AuthorizationDecision(
             AuthorizationDecision.Output.UNKNOWN, unknownPolicyNames);
       }
@@ -198,7 +198,7 @@ public class AuthorizationEngine {
     try {
       Object result = interpretable.eval(activation);
       if (result instanceof Boolean) {
-        return Boolean.valueOf(result.toString());
+        return Boolean.parseBoolean(result.toString());
       }
       // Throw an InterpreterException if there are missing Envoy Attributes.
       if (result instanceof IncompleteData) {

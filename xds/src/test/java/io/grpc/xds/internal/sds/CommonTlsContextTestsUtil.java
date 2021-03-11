@@ -33,6 +33,7 @@ import io.envoyproxy.envoy.config.core.v3.DataSource;
 import io.envoyproxy.envoy.config.core.v3.GrpcService;
 import io.envoyproxy.envoy.extensions.transport_sockets.tls.v3.CertificateValidationContext;
 import io.envoyproxy.envoy.extensions.transport_sockets.tls.v3.CommonTlsContext;
+import io.envoyproxy.envoy.extensions.transport_sockets.tls.v3.CommonTlsContext.CertificateProviderInstance;
 import io.envoyproxy.envoy.extensions.transport_sockets.tls.v3.CommonTlsContext.CombinedCertificateValidationContext;
 import io.envoyproxy.envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext;
 import io.envoyproxy.envoy.extensions.transport_sockets.tls.v3.SdsSecretConfig;
@@ -336,7 +337,7 @@ public class CommonTlsContextTestsUtil {
         buildTestDownstreamTlsContext(certName, validationContextName));
   }
 
-  static String getTempFileNameForResourcesFile(String resFile) throws IOException {
+  public static String getTempFileNameForResourcesFile(String resFile) throws IOException {
     return TestUtils.loadCert(resFile).getAbsolutePath();
   }
 
@@ -497,21 +498,38 @@ public class CommonTlsContextTestsUtil {
       String rootCertName,
       CertificateValidationContext staticCertValidationContext) {
     if (rootInstanceName != null) {
-      CommonTlsContext.CertificateProviderInstance.Builder providerInstanceBuilder =
-          CommonTlsContext.CertificateProviderInstance.newBuilder()
+      CertificateProviderInstance providerInstance =
+          CertificateProviderInstance.newBuilder()
               .setInstanceName(rootInstanceName)
-              .setCertificateName(rootCertName);
+              .setCertificateName(rootCertName)
+              .build();
       if (staticCertValidationContext != null) {
         CombinedCertificateValidationContext combined =
             CombinedCertificateValidationContext.newBuilder()
                 .setDefaultValidationContext(staticCertValidationContext)
-                .setValidationContextCertificateProviderInstance(providerInstanceBuilder)
+                .setValidationContextCertificateProviderInstance(providerInstance)
                 .build();
         return builder.setCombinedValidationContext(combined);
       }
-      builder = builder.setValidationContextCertificateProviderInstance(providerInstanceBuilder);
+      builder = builder.setValidationContextCertificateProviderInstance(providerInstance);
     }
     return builder;
+  }
+
+  static CommonTlsContext.Builder addCertificateValidationContext(
+      CommonTlsContext.Builder builder,
+      String name,
+      String targetUri,
+      String channelType,
+      CertificateValidationContext staticCertValidationContext) {
+    SdsSecretConfig sdsSecretConfig = buildSdsSecretConfig(name, targetUri, channelType);
+
+    CombinedCertificateValidationContext combined =
+        CombinedCertificateValidationContext.newBuilder()
+            .setDefaultValidationContext(staticCertValidationContext)
+            .setValidationContextSdsSecretConfig(sdsSecretConfig)
+            .build();
+    return builder.setCombinedValidationContext(combined);
   }
 
   /** Helper method to build UpstreamTlsContext for CertProvider tests. */

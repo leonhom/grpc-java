@@ -65,7 +65,6 @@ import io.grpc.LoadBalancer.SubchannelPicker;
 import io.grpc.LoadBalancer.SubchannelStateListener;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
-import io.grpc.NameResolver;
 import io.grpc.Status;
 import io.grpc.Status.Code;
 import io.grpc.SynchronizationContext;
@@ -652,13 +651,62 @@ public class GrpclbLoadBalancerTest {
 
     // This incident is logged
     assertThat(logs).containsExactly(
-        "DEBUG: Got an LB response: " + buildInitialResponse(9097),
-        "WARNING: Ignoring unexpected response type: INITIAL_RESPONSE").inOrder();
+            "DEBUG: [grpclb-<api.google.com>] Got an LB response: " + buildInitialResponse(9097),
+            "WARNING: [grpclb-<api.google.com>] "
+                + "Ignoring unexpected response type: INITIAL_RESPONSE")
+        .inOrder();
 
     // It doesn't affect load-reporting at all
     assertThat(fakeClock.getPendingTasks(LOAD_REPORTING_TASK_FILTER))
         .containsExactly(scheduledTask);
     assertEquals(1983, scheduledTask.getDelay(TimeUnit.MILLISECONDS));
+  }
+
+  @SuppressWarnings("unchecked")
+  @Test
+  public void raceBetweenHandleAddressesAndLbStreamClosure() {
+    InOrder inOrder = inOrder(mockLbService, backoffPolicyProvider, backoffPolicy1);
+    deliverResolvedAddresses(Collections.<EquivalentAddressGroup>emptyList(),
+        createResolvedBalancerAddresses(1));
+    assertEquals(1, fakeOobChannels.size());
+    inOrder.verify(mockLbService).balanceLoad(lbResponseObserverCaptor.capture());
+    StreamObserver<LoadBalanceResponse> lbResponseObserver = lbResponseObserverCaptor.getValue();
+    assertEquals(1, lbRequestObservers.size());
+    StreamObserver<LoadBalanceRequest> lbRequestObserver = lbRequestObservers.poll();
+    verify(lbRequestObserver).onNext(
+        eq(LoadBalanceRequest.newBuilder().setInitialRequest(
+            InitialLoadBalanceRequest.newBuilder().setName(SERVICE_AUTHORITY).build())
+            .build()));
+
+    // Close lbStream
+    lbResponseObserver.onCompleted();
+    inOrder.verify(backoffPolicyProvider).get();
+    inOrder.verify(backoffPolicy1).nextBackoffNanos();
+    // Retry task scheduled
+    assertEquals(1, fakeClock.numPendingTasks(LB_RPC_RETRY_TASK_FILTER));
+    FakeClock.ScheduledTask retryTask =
+        Iterables.getOnlyElement(fakeClock.getPendingTasks(LB_RPC_RETRY_TASK_FILTER));
+    assertEquals(10L, retryTask.getDelay(TimeUnit.NANOSECONDS));
+
+    // Receive the same Lb address again
+    deliverResolvedAddresses(Collections.<EquivalentAddressGroup>emptyList(),
+        createResolvedBalancerAddresses(1));
+    // Retry task cancelled
+    assertEquals(0, fakeClock.numPendingTasks(LB_RPC_RETRY_TASK_FILTER));
+    // Reuse the existing OOB channel
+    assertEquals(1, fakeOobChannels.size());
+    // Start a new LoadBalance RPC
+    inOrder.verify(mockLbService).balanceLoad(any(StreamObserver.class));
+    assertEquals(1, lbRequestObservers.size());
+    lbRequestObserver = lbRequestObservers.poll();
+    verify(lbRequestObserver).onNext(
+        eq(LoadBalanceRequest.newBuilder().setInitialRequest(
+            InitialLoadBalanceRequest.newBuilder().setName(SERVICE_AUTHORITY).build())
+            .build()));
+
+    // Simulate a race condition where the task has just started when it's cancelled
+    retryTask.command.run();
+    inOrder.verifyNoMoreInteractions();
   }
 
   @Test
@@ -739,8 +787,9 @@ public class GrpclbLoadBalancerTest {
     deliverNameResolutionError(error);
     verify(helper).updateBalancingState(eq(TRANSIENT_FAILURE), pickerCaptor.capture());
     assertThat(logs).containsExactly(
-        "DEBUG: Error: " + error,
-        "INFO: TRANSIENT_FAILURE: picks="
+        "INFO: [grpclb-<api.google.com>] Created",
+        "DEBUG: [grpclb-<api.google.com>] Error: " + error,
+        "INFO: [grpclb-<api.google.com>] Update balancing state to TRANSIENT_FAILURE: picks="
             + "[Status{code=NOT_FOUND, description=www.google.com not found, cause=null}],"
             + " drops=[]")
         .inOrder();
@@ -870,7 +919,8 @@ public class GrpclbLoadBalancerTest {
         .updateBalancingState(any(ConnectivityState.class), any(SubchannelPicker.class));
     logs.clear();
     lbResponseObserver.onNext(buildInitialResponse());
-    assertThat(logs).containsExactly("DEBUG: Got an LB response: " + buildInitialResponse());
+    assertThat(logs).containsExactly(
+        "DEBUG: [grpclb-<api.google.com>] Got an LB response: " + buildInitialResponse());
     logs.clear();
     lbResponseObserver.onNext(buildLbResponse(backends1));
 
@@ -902,19 +952,21 @@ public class GrpclbLoadBalancerTest {
     inOrder.verifyNoMoreInteractions();
 
     assertThat(logs).containsExactly(
-        "DEBUG: Got an LB response: " + buildLbResponse(backends1),
-        "INFO: Using RR list="
-            + "[[[/127.0.0.1:2000]/{io.grpc.grpclb.lbProvidedBackend=true}](token0001),"
-            + " [[/127.0.0.1:2010]/{io.grpc.grpclb.lbProvidedBackend=true}](token0002)],"
-            + " drop=[null, null]",
-        "INFO: CONNECTING: picks=[BUFFER_ENTRY], drops=[null, null]").inOrder();
+            "DEBUG: [grpclb-<api.google.com>] Got an LB response: " + buildLbResponse(backends1),
+            "INFO: [grpclb-<api.google.com>] Using RR list="
+                + "[[[/127.0.0.1:2000]/{io.grpc.grpclb.lbProvidedBackend=true}](token0001),"
+                + " [[/127.0.0.1:2010]/{io.grpc.grpclb.lbProvidedBackend=true}](token0002)],"
+                + " drop=[null, null]",
+            "INFO: [grpclb-<api.google.com>]"
+                + " Update balancing state to CONNECTING: picks=[BUFFER_ENTRY], drops=[null, null]")
+        .inOrder();
     logs.clear();
 
     // Let subchannels be connected
     deliverSubchannelState(subchannel2, ConnectivityStateInfo.forNonError(READY));
     inOrder.verify(helper).updateBalancingState(eq(READY), pickerCaptor.capture());
     assertThat(logs).containsExactly(
-        "INFO: READY: picks="
+        "INFO: [grpclb-<api.google.com>] Update balancing state to READY: picks="
             + "[[[[[/127.0.0.1:2010]/{io.grpc.grpclb.lbProvidedBackend=true}]](token0002)]],"
             + " drops=[null, null]");
     logs.clear();
@@ -928,7 +980,7 @@ public class GrpclbLoadBalancerTest {
     deliverSubchannelState(subchannel1, ConnectivityStateInfo.forNonError(READY));
     inOrder.verify(helper).updateBalancingState(eq(READY), pickerCaptor.capture());
     assertThat(logs).containsExactly(
-        "INFO: READY: picks="
+        "INFO: [grpclb-<api.google.com>] Update balancing state to READY: picks="
             + "[[[[[/127.0.0.1:2000]/{io.grpc.grpclb.lbProvidedBackend=true}]](token0001)],"
             + " [[[[/127.0.0.1:2010]/{io.grpc.grpclb.lbProvidedBackend=true}]](token0002)]],"
             + " drops=[null, null]");
@@ -947,7 +999,7 @@ public class GrpclbLoadBalancerTest {
     verify(subchannel1, times(2)).requestConnection();
     inOrder.verify(helper).updateBalancingState(eq(READY), pickerCaptor.capture());
     assertThat(logs).containsExactly(
-        "INFO: READY: picks="
+        "INFO: [grpclb-<api.google.com>] Update balancing state to READY: picks="
             + "[[[[[/127.0.0.1:2010]/{io.grpc.grpclb.lbProvidedBackend=true}]](token0002)]],"
             + " drops=[null, null]");
     logs.clear();
@@ -972,7 +1024,8 @@ public class GrpclbLoadBalancerTest {
     verify(subchannel2, times(2)).requestConnection();
     inOrder.verify(helper).updateBalancingState(eq(CONNECTING), pickerCaptor.capture());
     assertThat(logs).containsExactly(
-        "INFO: CONNECTING: picks=[BUFFER_ENTRY], drops=[null, null]");
+        "INFO: [grpclb-<api.google.com>] "
+            + "Update balancing state to CONNECTING: picks=[BUFFER_ENTRY], drops=[null, null]");
     logs.clear();
 
     RoundRobinPicker picker4 = (RoundRobinPicker) pickerCaptor.getValue();
@@ -992,14 +1045,15 @@ public class GrpclbLoadBalancerTest {
 
     lbResponseObserver.onNext(buildLbResponse(backends2));
     assertThat(logs).containsExactly(
-        "DEBUG: Got an LB response: " + buildLbResponse(backends2),
-        "INFO: Using RR list="
-            + "[[[/127.0.0.1:2030]/{io.grpc.grpclb.lbProvidedBackend=true}](token0003),"
-            + " [[/127.0.0.1:2010]/{io.grpc.grpclb.lbProvidedBackend=true}](token0004),"
-            + " [[/127.0.0.1:2030]/{io.grpc.grpclb.lbProvidedBackend=true}](token0005)],"
-            + " drop=[null, drop(token0003), null, null, drop(token0006)]",
-        "INFO: CONNECTING: picks=[BUFFER_ENTRY],"
-            + " drops=[null, drop(token0003), null, null, drop(token0006)]")
+            "DEBUG: [grpclb-<api.google.com>] Got an LB response: " + buildLbResponse(backends2),
+            "INFO: [grpclb-<api.google.com>] Using RR list="
+                + "[[[/127.0.0.1:2030]/{io.grpc.grpclb.lbProvidedBackend=true}](token0003),"
+                + " [[/127.0.0.1:2010]/{io.grpc.grpclb.lbProvidedBackend=true}](token0004),"
+                + " [[/127.0.0.1:2030]/{io.grpc.grpclb.lbProvidedBackend=true}](token0005)],"
+                + " drop=[null, drop(token0003), null, null, drop(token0006)]",
+            "INFO: [grpclb-<api.google.com>]"
+                + " Update balancing state to CONNECTING: picks=[BUFFER_ENTRY],"
+                + " drops=[null, drop(token0003), null, null, drop(token0006)]")
         .inOrder();
     logs.clear();
 
@@ -1098,6 +1152,49 @@ public class GrpclbLoadBalancerTest {
   }
 
   @Test
+  public void roundRobinMode_subchannelStayTransientFailureUntilReady() {
+    InOrder inOrder = inOrder(helper);
+    List<EquivalentAddressGroup> grpclbBalancerList = createResolvedBalancerAddresses(1);
+    deliverResolvedAddresses(Collections.<EquivalentAddressGroup>emptyList(), grpclbBalancerList);
+    verify(mockLbService).balanceLoad(lbResponseObserverCaptor.capture());
+    StreamObserver<LoadBalanceResponse> lbResponseObserver = lbResponseObserverCaptor.getValue();
+
+    // Simulate receiving LB response
+    List<ServerEntry> backends1 = Arrays.asList(
+        new ServerEntry("127.0.0.1", 2000, "token0001"),
+        new ServerEntry("127.0.0.1", 2010, "token0002"));
+    lbResponseObserver.onNext(buildInitialResponse());
+    lbResponseObserver.onNext(buildLbResponse(backends1));
+    assertEquals(2, mockSubchannels.size());
+    Subchannel subchannel1 = mockSubchannels.poll();
+    Subchannel subchannel2 = mockSubchannels.poll();
+
+    deliverSubchannelState(subchannel1, ConnectivityStateInfo.forNonError(CONNECTING));
+    deliverSubchannelState(subchannel2, ConnectivityStateInfo.forNonError(CONNECTING));
+    inOrder.verify(helper).updateBalancingState(eq(CONNECTING), any(SubchannelPicker.class));
+
+    // Switch subchannel1 to TRANSIENT_FAILURE, making the general state TRANSIENT_FAILURE too.
+    Status error = Status.UNAVAILABLE.withDescription("error1");
+    deliverSubchannelState(subchannel1, ConnectivityStateInfo.forTransientFailure(error));
+    inOrder.verify(helper).updateBalancingState(eq(TRANSIENT_FAILURE), pickerCaptor.capture());
+    assertThat(((RoundRobinPicker) pickerCaptor.getValue()).pickList)
+        .containsExactly(new ErrorEntry(error));
+
+    // Switch subchannel1 to IDLE, then to CONNECTING, which are ignored since the previous
+    // subchannel state is TRANSIENT_FAILURE. General state is unchanged.
+    deliverSubchannelState(subchannel1, ConnectivityStateInfo.forNonError(IDLE));
+    deliverSubchannelState(subchannel1, ConnectivityStateInfo.forNonError(CONNECTING));
+    inOrder.verifyNoMoreInteractions();
+
+    // Switch subchannel1 to READY, which will affect the general state
+    deliverSubchannelState(subchannel1, ConnectivityStateInfo.forNonError(READY));
+    inOrder.verify(helper).updateBalancingState(eq(READY), pickerCaptor.capture());
+    assertThat(((RoundRobinPicker) pickerCaptor.getValue()).pickList)
+        .containsExactly(new BackendEntry(subchannel1, getLoadRecorder(), "token0001"));
+    inOrder.verifyNoMoreInteractions();
+  }
+
+  @Test
   public void grpclbFallback_initialTimeout_serverListReceivedBeforeTimerExpires() {
     subtestGrpclbFallbackInitialTimeout(false);
   }
@@ -1154,10 +1251,14 @@ public class GrpclbLoadBalancerTest {
       List<EquivalentAddressGroup> fallbackList =
           Arrays.asList(backendList.get(0), backendList.get(1));
       assertThat(logs).containsExactly(
-          "INFO: Using fallback backends",
-          "INFO: Using RR list=[[[FakeSocketAddress-fake-address-0]/{}], "
-              + "[[FakeSocketAddress-fake-address-1]/{}]], drop=[null, null]",
-          "INFO: CONNECTING: picks=[BUFFER_ENTRY], drops=[null, null]").inOrder();
+              "INFO: [grpclb-<api.google.com>] Using fallback backends",
+              "INFO: [grpclb-<api.google.com>]"
+                  + " Using RR list=[[[FakeSocketAddress-fake-address-0]/{}], "
+                  + "[[FakeSocketAddress-fake-address-1]/{}]], drop=[null, null]",
+              "INFO: [grpclb-<api.google.com>] "
+                  + "Update balancing state to CONNECTING: picks=[BUFFER_ENTRY], "
+                  + "drops=[null, null]")
+          .inOrder();
 
       // Fall back to the backends from resolver
       fallbackTestVerifyUseOfFallbackBackendLists(inOrder, fallbackList);
@@ -1314,11 +1415,14 @@ public class GrpclbLoadBalancerTest {
     List<EquivalentAddressGroup> backendList = createResolvedBackendAddresses(2);
     deliverResolvedAddresses(backendList, Collections.<EquivalentAddressGroup>emptyList());
 
-    assertThat(logs).containsExactly(
-        "INFO: Using fallback backends",
-        "INFO: Using RR list=[[[FakeSocketAddress-fake-address-0]/{}], "
-            + "[[FakeSocketAddress-fake-address-1]/{}]], drop=[null, null]",
-        "INFO: CONNECTING: picks=[BUFFER_ENTRY], drops=[null, null]").inOrder();
+    assertThat(logs).containsAtLeast(
+            "INFO: [grpclb-<api.google.com>] Using fallback backends",
+            "INFO: [grpclb-<api.google.com>] "
+                + "Using RR list=[[[FakeSocketAddress-fake-address-0]/{}], "
+                + "[[FakeSocketAddress-fake-address-1]/{}]], drop=[null, null]",
+            "INFO: [grpclb-<api.google.com>] "
+                + "Update balancing state to CONNECTING: picks=[BUFFER_ENTRY], drops=[null, null]")
+        .inOrder();
 
     // Fall back to the backends from resolver
     fallbackTestVerifyUseOfFallbackBackendLists(inOrder, backendList);
@@ -2246,7 +2350,8 @@ public class GrpclbLoadBalancerTest {
         .updateBalancingState(any(ConnectivityState.class), any(SubchannelPicker.class));
     logs.clear();
     lbResponseObserver.onNext(buildInitialResponse());
-    assertThat(logs).containsExactly("DEBUG: Got an LB response: " + buildInitialResponse());
+    assertThat(logs).containsExactly(
+        "DEBUG: [grpclb-<api.google.com>] Got an LB response: " + buildInitialResponse());
     logs.clear();
     lbResponseObserver.onNext(buildLbResponse(backends1));
 
@@ -2280,19 +2385,21 @@ public class GrpclbLoadBalancerTest {
     inOrder.verifyNoMoreInteractions();
 
     assertThat(logs).containsExactly(
-        "DEBUG: Got an LB response: " + buildLbResponse(backends1),
-        "INFO: Using RR list="
-            + "[[[/127.0.0.1:2000]/{io.grpc.grpclb.lbProvidedBackend=true}](token0001),"
-            + " [[/127.0.0.1:2010]/{io.grpc.grpclb.lbProvidedBackend=true}](token0002)],"
-            + " drop=[null, null]",
-        "INFO: CONNECTING: picks=[BUFFER_ENTRY], drops=[null, null]").inOrder();
+            "DEBUG: [grpclb-<api.google.com>] Got an LB response: " + buildLbResponse(backends1),
+            "INFO: [grpclb-<api.google.com>] Using RR list="
+                + "[[[/127.0.0.1:2000]/{io.grpc.grpclb.lbProvidedBackend=true}](token0001),"
+                + " [[/127.0.0.1:2010]/{io.grpc.grpclb.lbProvidedBackend=true}](token0002)],"
+                + " drop=[null, null]",
+            "INFO: [grpclb-<api.google.com>] "
+                + "Update balancing state to CONNECTING: picks=[BUFFER_ENTRY], drops=[null, null]")
+        .inOrder();
     logs.clear();
 
     // Let subchannels be connected
     deliverSubchannelState(subchannel2, ConnectivityStateInfo.forNonError(READY));
     inOrder.verify(helper).updateBalancingState(eq(READY), pickerCaptor.capture());
     assertThat(logs).containsExactly(
-        "INFO: READY: picks="
+        "INFO: [grpclb-<api.google.com>] Update balancing state to READY: picks="
             + "[[[[[/127.0.0.1:2010]/{io.grpc.grpclb.lbProvidedBackend=true}]](token0002)]],"
             + " drops=[null, null]");
     logs.clear();
@@ -2306,7 +2413,7 @@ public class GrpclbLoadBalancerTest {
     deliverSubchannelState(subchannel1, ConnectivityStateInfo.forNonError(READY));
     inOrder.verify(helper).updateBalancingState(eq(READY), pickerCaptor.capture());
     assertThat(logs).containsExactly(
-        "INFO: READY: picks="
+        "INFO: [grpclb-<api.google.com>] Update balancing state to READY: picks="
             + "[[[[[/127.0.0.1:2000]/{io.grpc.grpclb.lbProvidedBackend=true}]](token0001)],"
             + " [[[[/127.0.0.1:2010]/{io.grpc.grpclb.lbProvidedBackend=true}]](token0002)]],"
             + " drops=[null, null]");
@@ -2373,19 +2480,21 @@ public class GrpclbLoadBalancerTest {
     inOrder.verifyNoMoreInteractions();
 
     assertThat(logs).containsExactly(
-        "DEBUG: Got an LB response: " + buildLbResponse(backends2),
-        "INFO: Using RR list="
-            + "[[[/127.0.0.1:8000]/{io.grpc.grpclb.lbProvidedBackend=true}](token1001),"
-            + " [[/127.0.0.1:8010]/{io.grpc.grpclb.lbProvidedBackend=true}](token1002)],"
-            + " drop=[null, null]",
-        "INFO: CONNECTING: picks=[BUFFER_ENTRY], drops=[null, null]").inOrder();
+            "DEBUG: [grpclb-<api.google.com>] Got an LB response: " + buildLbResponse(backends2),
+            "INFO: [grpclb-<api.google.com>] Using RR list="
+                + "[[[/127.0.0.1:8000]/{io.grpc.grpclb.lbProvidedBackend=true}](token1001),"
+                + " [[/127.0.0.1:8010]/{io.grpc.grpclb.lbProvidedBackend=true}](token1002)],"
+                + " drop=[null, null]",
+            "INFO: [grpclb-<api.google.com>] "
+                + "Update balancing state to CONNECTING: picks=[BUFFER_ENTRY], drops=[null, null]")
+        .inOrder();
     logs.clear();
 
     // Let new subchannels be connected
     deliverSubchannelState(subchannel3, ConnectivityStateInfo.forNonError(READY));
     inOrder.verify(helper).updateBalancingState(eq(READY), pickerCaptor.capture());
     assertThat(logs).containsExactly(
-        "INFO: READY: picks="
+        "INFO: [grpclb-<api.google.com>] Update balancing state to READY: picks="
             + "[[[[[/127.0.0.1:8000]/{io.grpc.grpclb.lbProvidedBackend=true}]](token1001)]],"
             + " drops=[null, null]");
     logs.clear();
@@ -2398,7 +2507,7 @@ public class GrpclbLoadBalancerTest {
     deliverSubchannelState(subchannel4, ConnectivityStateInfo.forNonError(READY));
     inOrder.verify(helper).updateBalancingState(eq(READY), pickerCaptor.capture());
     assertThat(logs).containsExactly(
-        "INFO: READY: picks="
+        "INFO: [grpclb-<api.google.com>] Update balancing state to READY: picks="
             + "[[[[[/127.0.0.1:8000]/{io.grpc.grpclb.lbProvidedBackend=true}]](token1001)],"
             + " [[[[/127.0.0.1:8010]/{io.grpc.grpclb.lbProvidedBackend=true}]](token1002)]],"
             + " drops=[null, null]");
@@ -2628,12 +2737,6 @@ public class GrpclbLoadBalancerTest {
     public void updateBalancingState(
         @Nonnull ConnectivityState newState, @Nonnull SubchannelPicker newPicker) {
       currentPicker = newPicker;
-    }
-
-    @Override
-    @SuppressWarnings("deprecation")
-    public NameResolver.Factory getNameResolverFactory() {
-      return mock(NameResolver.Factory.class);
     }
 
     @Override

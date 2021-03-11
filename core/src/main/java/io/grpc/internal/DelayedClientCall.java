@@ -30,6 +30,7 @@ import io.grpc.Metadata;
 import io.grpc.Status;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -40,14 +41,13 @@ import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 
 /**
- * A call that queues requests before the transport is available, and delegates to a real call
- * implementation when the transport is available.
+ * A call that queues requests before a real call is ready to be delegated to.
  *
  * <p>{@code ClientCall} itself doesn't require thread-safety. However, the state of {@code
  * DelayedCall} may be internally altered by different threads, thus internal synchronization is
  * necessary.
  */
-final class DelayedClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
+public class DelayedClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
   private static final Logger logger = Logger.getLogger(DelayedClientCall.class.getName());
   /**
    * A timer to monitor the initial deadline. The timer must be cancelled on transition to the real
@@ -73,7 +73,7 @@ final class DelayedClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
   @GuardedBy("this")
   private DelayedListener<RespT> delayedListener;
 
-  DelayedClientCall(
+  protected DelayedClientCall(
       Executor callExecutor, ScheduledExecutorService scheduler, @Nullable Deadline deadline) {
     this.callExecutor = checkNotNull(callExecutor, "callExecutor");
     checkNotNull(scheduler, "scheduler");
@@ -117,7 +117,7 @@ final class DelayedClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
       buf.append("Deadline exceeded after ");
     }
     buf.append(seconds);
-    buf.append(String.format(".%09d", nanos));
+    buf.append(String.format(Locale.US, ".%09d", nanos));
     buf.append("s. ");
     /** Cancels the call if deadline exceeded prior to the real call being set. */
     class DeadlineExceededRunnable implements Runnable {
@@ -141,7 +141,7 @@ final class DelayedClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
    * <p>No-op if either this method or {@link #cancel} have already been called.
    */
   // When this method returns, passThrough is guaranteed to be true
-  final void setCall(ClientCall<ReqT, RespT> call) {
+  public final void setCall(ClientCall<ReqT, RespT> call) {
     synchronized (this) {
       // If realCall != null, then either setCall() or cancel() has been called.
       if (realCall != null) {
@@ -153,7 +153,7 @@ final class DelayedClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
   }
 
   @Override
-  public void start(Listener<RespT> listener, final Metadata headers) {
+  public final void start(Listener<RespT> listener, final Metadata headers) {
     checkState(this.listener == null, "already started");
     Status savedError;
     boolean savedPassThrough;
@@ -185,7 +185,7 @@ final class DelayedClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
 
   // When this method returns, passThrough is guaranteed to be true
   @Override
-  public void cancel(@Nullable final String message, @Nullable final Throwable cause) {
+  public final void cancel(@Nullable final String message, @Nullable final Throwable cause) {
     Status status = Status.CANCELLED;
     if (message != null) {
       status = status.withDescription(message);
@@ -231,6 +231,10 @@ final class DelayedClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
       }
       drainPendingCalls();
     }
+    callCancelled();
+  }
+
+  protected void callCancelled() {
   }
 
   private void delayOrExecute(Runnable runnable) {
@@ -302,12 +306,12 @@ final class DelayedClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
   }
 
   @VisibleForTesting
-  ClientCall<ReqT, RespT> getRealCall() {
+  final ClientCall<ReqT, RespT> getRealCall() {
     return realCall;
   }
 
   @Override
-  public void sendMessage(final ReqT message) {
+  public final void sendMessage(final ReqT message) {
     if (passThrough) {
       realCall.sendMessage(message);
     } else {
@@ -321,7 +325,7 @@ final class DelayedClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
   }
 
   @Override
-  public void setMessageCompression(final boolean enable) {
+  public final void setMessageCompression(final boolean enable) {
     if (passThrough) {
       realCall.setMessageCompression(enable);
     } else {
@@ -335,7 +339,7 @@ final class DelayedClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
   }
 
   @Override
-  public void request(final int numMessages) {
+  public final void request(final int numMessages) {
     if (passThrough) {
       realCall.request(numMessages);
     } else {
@@ -349,7 +353,7 @@ final class DelayedClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
   }
 
   @Override
-  public void halfClose() {
+  public final void halfClose() {
     delayOrExecute(new Runnable() {
       @Override
       public void run() {
@@ -359,7 +363,7 @@ final class DelayedClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
   }
 
   @Override
-  public boolean isReady() {
+  public final boolean isReady() {
     if (passThrough) {
       return realCall.isReady();
     } else {
@@ -368,7 +372,7 @@ final class DelayedClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
   }
 
   @Override
-  public Attributes getAttributes() {
+  public final Attributes getAttributes() {
     ClientCall<ReqT, RespT> savedRealCall;
     synchronized (this) {
       savedRealCall = realCall;
